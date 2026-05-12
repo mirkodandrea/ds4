@@ -9693,7 +9693,45 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+    if (ok && g_shard_pool) {
+        /* Remote expert dispatch: GPU→CPU bounce.
+         * Flush pending GPU commands (attention + routing) so that
+         * router_selected, router_weights and ffn_norm are readable.
+         * Read results, quantize, dispatch to remote shards, write
+         * routed_out back, then resume GPU command encoding. */
+        ok = ds4_gpu_end_commands() != 0;
+
+        int32_t  sel_i32[DS4_N_EXPERT_USED];
+        float    ew[DS4_N_EXPERT_USED];
+        float    norm_cpu[DS4_N_EMBD];
+
+        if (ok) ok = ds4_gpu_tensor_read(g->router_selected, 0,
+                         sel_i32, sizeof(sel_i32)) != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->router_weights, 0,
+                         ew, sizeof(ew)) != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->ffn_norm, 0,
+                         norm_cpu, sizeof(norm_cpu)) != 0;
+
+        if (ok) {
+            int sel_int[DS4_N_EXPERT_USED];
+            for (int i = 0; i < DS4_N_EXPERT_USED; i++)
+                sel_int[i] = (int)sel_i32[i];
+
+            block_q8_K xq[DS4_N_EMBD / 256];
+            ds4_quantize_row_q8_K(norm_cpu, xq, DS4_N_EMBD);
+
+            float routed[DS4_N_EMBD];
+            memset(routed, 0, sizeof(routed));
+            ds4_shard_pool_dispatch_layer(g_shard_pool, (uint8_t)il,
+                xq, sel_int, ew, DS4_N_EXPERT_USED, routed);
+
+            ok = ds4_gpu_tensor_write(g->routed_out, 0,
+                     routed, sizeof(routed)) != 0;
+        }
+
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+    } else if (ok) {
+        ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
@@ -9711,18 +9749,19 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+    }
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
-    if (ok) {
+    if (ok && !g_shard_pool) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_up_clamped", g->routed_up,
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
     }
-    if (ok) {
+    if (ok && !g_shard_pool) {
         metal_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->routed_mid,
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
     }
-    if (ok) {
+    if (ok && !g_shard_pool) {
         metal_graph_debug_dump_tensor("ffn_moe_down", g->routed_down,
                                       (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
     }
@@ -16733,6 +16772,26 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         for (int i = 0; i < n; i++) free((char *)cfgs[i].host);
         free(cfgs);
         g_shard_pool = e->shard_pool;
+
+        /* Hint the OS not to page-in expert weight data on the coordinator.
+         * With mmap lazy loading, these pages stay on disk unless something
+         * reads them.  The remote dispatch path skips all local expert
+         * matmuls, so the hint is a safety net against accidental access. */
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *lw = &e->weights.layer[il];
+            const ds4_tensor *exp_tensors[] = {
+                lw->ffn_gate_exps, lw->ffn_up_exps, lw->ffn_down_exps
+            };
+            for (int t = 0; t < 3; t++) {
+                const ds4_tensor *et = exp_tensors[t];
+                if (!et) continue;
+                uintptr_t base = (uintptr_t)e->model.map + et->abs_offset;
+                uintptr_t page = base & ~(uintptr_t)4095;
+                size_t len = (size_t)(et->bytes + (base - page));
+                (void)posix_madvise((void *)page, len, POSIX_MADV_DONTNEED);
+            }
+        }
+        fprintf(stderr, "ds4: expert shards connected, expert weight pages marked DONTNEED\n");
     }
 
     *out = e;
