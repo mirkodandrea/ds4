@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_moe_shard.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -109,6 +110,7 @@ enum {
 };
 
 static int g_ds4_lock_fd = -1;
+static ds4_shard_pool *g_shard_pool = NULL;  /* remote expert dispatch (NULL = local) */
 
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
@@ -5372,7 +5374,9 @@ static void layer_routed_moe_one(
 }
 
 /* Decode version of routed MoE: same math as layer_routed_moe_one(), but all
- * large temporaries come from the persistent scratch arena. */
+ * large temporaries come from the persistent scratch arena.  When g_shard_pool
+ * is set, routing runs locally and expert computation is dispatched to remote
+ * CPU-only machines over TCP. */
 static void layer_routed_moe_one_prealloc(
         float             * out,
         const ds4_model   * model,
@@ -5400,6 +5404,19 @@ static void layer_routed_moe_one_prealloc(
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+    }
+
+    /* Remote expert dispatch: send Q8_K activation + selected experts to
+     * shard servers, receive weighted partial sums back. */
+    if (g_shard_pool) {
+        ds4_shard_pool_dispatch_layer(g_shard_pool,
+                                      (uint8_t)il,
+                                      xq,
+                                      selected,
+                                      expert_weight,
+                                      DS4_N_EXPERT_USED,
+                                      out);
+        return;
     }
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
@@ -13944,6 +13961,7 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+    ds4_shard_pool *shard_pool;  /* NULL when experts run locally */
 };
 
 static bool cpu_directional_steering_enabled(
@@ -16524,6 +16542,56 @@ int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+/* Compute a batch of routed experts on the local CPU.  Used by the expert
+ * server binary.  xq_bytes points to DS4_SHARD_Q8K_BYTES of Q8_K blocks.
+ * Returns 0 on success, weighted partial sum written to out[DS4_N_EMBD]. */
+int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
+                               const void *xq_bytes,
+                               const uint16_t *expert_ids,
+                               const float *expert_weights,
+                               int n_experts, float *out) {
+    if (!e || layer >= DS4_N_LAYER || n_experts <= 0 ||
+        n_experts > DS4_N_EXPERT_USED)
+        return -1;
+
+    const ds4_model *model = &e->model;
+    const ds4_layer_weights *lw = &e->weights.layer[layer];
+    const block_q8_K *xq = (const block_q8_K *)xq_bytes;
+
+    int selected[DS4_N_EXPERT_USED];
+    float weights[DS4_N_EXPERT_USED];
+    for (int i = 0; i < n_experts; i++) {
+        selected[i] = (int)expert_ids[i];
+        weights[i] = expert_weights[i];
+    }
+
+    float *mid_all = xmalloc((size_t)n_experts * DS4_N_FF_EXP * sizeof(float));
+    block_q8_K *midq = xmalloc((size_t)n_experts * (DS4_N_FF_EXP / QK_K) * sizeof(block_q8_K));
+
+    memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
+
+    matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
+                                        lw->ffn_gate_exps,
+                                        lw->ffn_up_exps,
+                                        xq,
+                                        selected,
+                                        weights,
+                                        n_experts,
+                                        DS4_SWIGLU_CLAMP_EXP);
+
+    for (int i = 0; i < n_experts; i++) {
+        ds4_quantize_row_q8_K(mid_all + (uint64_t)i * DS4_N_FF_EXP,
+                              midq + (uint64_t)i * (DS4_N_FF_EXP / QK_K),
+                              (int64_t)DS4_N_FF_EXP);
+    }
+    matvec_q2_k_experts_accum_prequant(out, model, lw->ffn_down_exps,
+                                       midq, selected, n_experts);
+
+    free(midq);
+    free(mid_all);
+    return 0;
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -16644,6 +16712,29 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 #endif
 
+    /* Connect to remote expert shards if configured. */
+    if (opt->expert_shards && opt->expert_shards[0]) {
+        ds4_shard_config *cfgs = NULL;
+        int n = ds4_shard_config_parse(opt->expert_shards, &cfgs);
+        if (n <= 0) {
+            fprintf(stderr, "ds4: failed to parse --expert-shards spec\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (ds4_shard_pool_create(&e->shard_pool, cfgs, n) != 0) {
+            fprintf(stderr, "ds4: failed to connect to expert shard(s)\n");
+            for (int i = 0; i < n; i++) free((char *)cfgs[i].host);
+            free(cfgs);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        for (int i = 0; i < n; i++) free((char *)cfgs[i].host);
+        free(cfgs);
+        g_shard_pool = e->shard_pool;
+    }
+
     *out = e;
     return 0;
 }
@@ -16654,6 +16745,10 @@ void ds4_engine_summary(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    if (e->shard_pool) {
+        g_shard_pool = NULL;
+        ds4_shard_pool_close(e->shard_pool);
+    }
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();

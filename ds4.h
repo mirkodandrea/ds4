@@ -67,6 +67,7 @@ typedef struct {
     float directional_steering_ffn;
     bool warm_weights;
     bool quality;
+    const char *expert_shards;  /* "host:port:start-end,..." or NULL */
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
@@ -172,6 +173,14 @@ int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
+
+/* MoE expert shard support.  Compute a batch of routed experts on the local
+ * CPU and return the weighted partial sum.  Used by ds4-expert-server. */
+int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
+                               const void *xq_bytes,
+                               const uint16_t *expert_ids,
+                               const float *expert_weights,
+                               int n_experts, float *out);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
