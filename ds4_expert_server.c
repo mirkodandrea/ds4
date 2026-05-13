@@ -271,6 +271,7 @@ static void handle_connection(int cfd, ds4_engine *engine,
                         }
                     }
                 }
+                const double t_unpack = profile ? server_now_sec() : 0.0;
 
                 /* Batched expert compute — single call. */
                 if (ok_batch) {
@@ -288,12 +289,14 @@ static void handle_connection(int cfd, ds4_engine *engine,
                 if (profile) {
                     const double t_done = server_now_sec();
                     fprintf(stderr,
-                            "expert-server: batch profile layer=%u tokens=%u selected=%u recv=%.3f ms compute=%.3f ms send=%.3f ms total=%.3f ms\n",
+                            "expert-server: batch layer=%u tokens=%u selected=%u "
+                            "recv=%.3f unpack=%.3f compute=%.3f send=%.3f total=%.3f ms\n",
                             layer,
                             n_tokens,
                             n_selected,
                             (t_recv - t0) * 1000.0,
-                            (t_compute - t_recv) * 1000.0,
+                            (t_unpack - t_recv) * 1000.0,
+                            (t_compute - t_unpack) * 1000.0,
                             (t_done - t_compute) * 1000.0,
                             (t_done - t0) * 1000.0);
                 }

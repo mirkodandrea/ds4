@@ -577,7 +577,8 @@ int ds4_shard_pool_dispatch_layer_batch(
 
     const int profile = shard_profile_enabled();
     const double t0 = profile ? shard_now_sec() : 0.0;
-    memset(out, 0, (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(float));
+    if (p->n_shards != 1)
+        memset(out, 0, (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(float));
 
     const size_t tok_row = (size_t)n_tokens * (size_t)n_selected;
     const size_t out_floats = (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD;
@@ -650,6 +651,7 @@ int ds4_shard_pool_dispatch_layer_batch(
     }
 
     /* ---- Fire: signal all active shard workers in parallel ---- */
+    const double t_prepared = profile ? shard_now_sec() : 0.0;
     for (int i = 0; i < n_active; i++) {
         shard_worker *w = &p->workers[active_si[i]];
         pthread_mutex_lock(&w->mutex);
@@ -660,6 +662,7 @@ int ds4_shard_pool_dispatch_layer_batch(
     }
 
     /* ---- Join: wait for all workers, accumulate partials ---- */
+    const double t_fired = profile ? shard_now_sec() : 0.0;
     int rc = 0;
     for (int i = 0; i < n_active; i++) {
         shard_worker *w = &p->workers[active_si[i]];
@@ -684,12 +687,15 @@ int ds4_shard_pool_dispatch_layer_batch(
     if (profile) {
         const double t_done = shard_now_sec();
         fprintf(stderr,
-                "ds4_moe_shard: pool batch profile layer=%u shards=%d(%d active) tokens=%d selected=%d total=%.3f ms\n",
+                "ds4_moe_shard: pool batch layer=%u shards=%d(%d active) tokens=%d "
+                "prepare=%.3f signal=%.3f wait+accum=%.3f total=%.3f ms\n",
                 layer,
                 p->n_shards,
                 n_active,
                 n_tokens,
-                n_selected,
+                (t_prepared - t0) * 1000.0,
+                (t_fired - t_prepared) * 1000.0,
+                (t_done - t_fired) * 1000.0,
                 (t_done - t0) * 1000.0);
     }
     return rc;

@@ -17893,6 +17893,16 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
         n_selected <= 0 || n_selected > DS4_N_EXPERT_USED)
         return -1;
 
+    /* Batch compute phase profiling (DS4_EXPERT_BATCH_PROFILE=1). */
+    static int profile_batch_compute = -1;
+    if (profile_batch_compute < 0)
+        profile_batch_compute = (getenv("DS4_EXPERT_BATCH_PROFILE") != NULL) ? 1 : 0;
+    const int do_profile = profile_batch_compute;
+    struct timespec _ts_tmp;
+    #define PROF_NOW() (clock_gettime(CLOCK_MONOTONIC, &_ts_tmp) == 0 \
+        ? (double)_ts_tmp.tv_sec + (double)_ts_tmp.tv_nsec * 1e-9 : 0.0)
+    const double tp_start = do_profile ? PROF_NOW() : 0.0;
+
     const ds4_model *model = &e->model;
     const ds4_layer_weights *lw = &e->weights.layer[layer];
     const size_t q8k_blocks = DS4_N_EMBD / QK_K;
@@ -17999,6 +18009,8 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
      * loaded from DRAM once; inner loop computes all tokens using that expert.
      * With batch=90: ~160 unique experts instead of 540 slots → fewer rows
      * to process AND better cache reuse (weights stay in L3 across tokens). */
+    const double tp_setup = do_profile ? PROF_NOW() : 0.0;
+
     expert_grouped_mid_ctx mctx = {
         .mid = mid_all,
         .groups = groups,
@@ -18009,6 +18021,7 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
     };
     ds4_parallel_for((uint64_t)n_unique * gate_out_dim,
                      expert_grouped_mid_worker, &mctx);
+    const double tp_phase1 = do_profile ? PROF_NOW() : 0.0;
 
     free(groups);
     free(all_refs);
@@ -18020,6 +18033,7 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
         .mid_blocks = mid_blocks,
     };
     ds4_parallel_for((uint64_t)total_experts, batch_quantize_q8k_worker, &qctx);
+    const double tp_phase2 = do_profile ? PROF_NOW() : 0.0;
 
     /* Phase 3 setup: build per-token descriptors for down projection. */
     int n_active_tokens = 0;
@@ -18067,6 +18081,20 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
     };
     ds4_parallel_for((uint64_t)n_active_tokens * down_out_dim,
                      batch_down_worker, &dctx);
+    const double tp_phase3 = do_profile ? PROF_NOW() : 0.0;
+
+    if (do_profile) {
+        fprintf(stderr,
+                "ds4_batch_compute: layer=%u tokens=%d experts=%d(unique=%d) "
+                "setup=%.3f phase1=%.3f phase2=%.3f phase3=%.3f total=%.3f ms\n",
+                layer, n_tokens, total_experts, n_unique,
+                (tp_setup - tp_start) * 1000.0,
+                (tp_phase1 - tp_setup) * 1000.0,
+                (tp_phase2 - tp_phase1) * 1000.0,
+                (tp_phase3 - tp_phase2) * 1000.0,
+                (tp_phase3 - tp_start) * 1000.0);
+    }
+    #undef PROF_NOW
 
     free(down_tokens);
     free(midq);
