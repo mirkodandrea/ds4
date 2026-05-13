@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -24,6 +25,16 @@
 static void die(const char *msg) {
     fprintf(stderr, "ds4_moe_shard: %s\n", msg);
     exit(1);
+}
+
+static double shard_now_sec(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static int shard_profile_enabled(void) {
+    return getenv("DS4_EXPERT_SHARD_PROFILE") != NULL;
 }
 
 static int full_send(int fd, const void *buf, size_t len) {
@@ -148,6 +159,8 @@ int ds4_shard_dispatch_layer(
     float            *out)
 {
     if (n_experts <= 0 || n_experts > DS4_SHARD_N_EXPERT_USED) return -1;
+    const int profile = shard_profile_enabled();
+    const double t0 = profile ? shard_now_sec() : 0.0;
 
     /* Build request. */
     uint8_t hdr[DS4_SHARD_REQ_HDR_SIZE];
@@ -162,10 +175,12 @@ int ds4_shard_dispatch_layer(
     if (full_send(s->fd, expert_ids, (size_t)n_experts * sizeof(uint16_t)) != 0) return -1;
     if (full_send(s->fd, expert_weights, (size_t)n_experts * sizeof(float)) != 0) return -1;
     if (full_send(s->fd, xq, DS4_SHARD_Q8K_BYTES) != 0) return -1;
+    const double t_sent = profile ? shard_now_sec() : 0.0;
 
     /* Read response. */
     uint8_t rsp_hdr[DS4_SHARD_RSP_HDR_SIZE];
     if (full_recv(s->fd, rsp_hdr, sizeof(rsp_hdr)) != 0) return -1;
+    const double t_rsp_hdr = profile ? shard_now_sec() : 0.0;
 
     uint32_t rsp_magic;
     memcpy(&rsp_magic, rsp_hdr, 4);
@@ -173,6 +188,19 @@ int ds4_shard_dispatch_layer(
     if (rsp_hdr[4] != DS4_SHARD_STATUS_OK) return -1;
 
     if (full_recv(s->fd, out, (size_t)DS4_SHARD_N_EMBD * sizeof(float)) != 0) return -1;
+    if (profile) {
+        const double t_done = shard_now_sec();
+        fprintf(stderr,
+                "ds4_moe_shard: profile host=%s:%u layer=%u experts=%d send=%.3f ms wait_hdr=%.3f ms recv_out=%.3f ms total=%.3f ms\n",
+                s->host,
+                s->port,
+                layer,
+                n_experts,
+                (t_sent - t0) * 1000.0,
+                (t_rsp_hdr - t_sent) * 1000.0,
+                (t_done - t_rsp_hdr) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
     return 0;
 }
 
@@ -325,7 +353,11 @@ int ds4_shard_pool_dispatch_layer(
     int               n_selected,
     float            *out)
 {
+    const int profile = shard_profile_enabled();
+    const double t0 = profile ? shard_now_sec() : 0.0;
     /* Partition selected experts by shard ownership and kick off workers. */
+    const double t_signaled = profile ? shard_now_sec() : 0.0;
+
     for (int si = 0; si < p->n_shards; si++) {
         shard_worker *w = &p->workers[si];
         w->layer = layer;
@@ -370,6 +402,17 @@ int ds4_shard_pool_dispatch_layer(
         }
     }
 
+    if (profile) {
+        const double t_done = shard_now_sec();
+        fprintf(stderr,
+                "ds4_moe_shard: pool profile layer=%u shards=%d selected=%d signal=%.3f ms wait_sum=%.3f ms total=%.3f ms\n",
+                layer,
+                p->n_shards,
+                n_selected,
+                (t_signaled - t0) * 1000.0,
+                (t_done - t_signaled) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
     return 0;
 }
 

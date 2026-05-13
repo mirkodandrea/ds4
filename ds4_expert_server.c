@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_stop = 0;
@@ -32,6 +33,16 @@ static volatile sig_atomic_t g_stop = 0;
 static void stop_handler(int sig) {
     (void)sig;
     g_stop = 1;
+}
+
+static double server_now_sec(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static int server_profile_enabled(void) {
+    return getenv("DS4_EXPERT_SHARD_PROFILE") != NULL;
 }
 
 static int full_send(int fd, const void *buf, size_t len) {
@@ -86,6 +97,8 @@ static void handle_connection(int cfd, ds4_engine *engine,
     float out[DS4_SHARD_N_EMBD];
 
     while (!g_stop) {
+        const int profile = server_profile_enabled();
+        const double t0 = profile ? server_now_sec() : 0.0;
         if (full_recv(cfd, hdr, sizeof(hdr)) != 0) break;
 
         uint32_t magic;
@@ -137,6 +150,7 @@ static void handle_connection(int cfd, ds4_engine *engine,
             continue;
         }
         if (full_recv(cfd, xq_buf, act_size) != 0) break;
+        const double t_recv = profile ? server_now_sec() : 0.0;
 
         /* Validate expert ownership. */
         bool valid = true;
@@ -156,12 +170,24 @@ static void handle_connection(int cfd, ds4_engine *engine,
         int rc = ds4_engine_compute_experts(engine, layer, xq_buf,
                                             expert_ids, expert_weights,
                                             n_experts, out);
+        const double t_compute = profile ? server_now_sec() : 0.0;
         if (rc != 0) {
             send_response(cfd, DS4_SHARD_STATUS_ERR, layer, NULL);
             continue;
         }
 
         send_response(cfd, DS4_SHARD_STATUS_OK, layer, out);
+        if (profile) {
+            const double t_done = server_now_sec();
+            fprintf(stderr,
+                    "expert-server: profile layer=%u experts=%u recv=%.3f ms compute=%.3f ms send=%.3f ms total=%.3f ms\n",
+                    layer,
+                    n_experts,
+                    (t_recv - t0) * 1000.0,
+                    (t_compute - t_recv) * 1000.0,
+                    (t_done - t_compute) * 1000.0,
+                    (t_done - t0) * 1000.0);
+        }
     }
 }
 

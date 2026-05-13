@@ -9699,7 +9699,10 @@ static bool metal_graph_encode_decode_layer(
          * router_selected, router_weights and ffn_norm are readable.
          * Read results, quantize, dispatch to remote shards, write
          * routed_out back, then resume GPU command encoding. */
+        const bool shard_profile = getenv("DS4_EXPERT_SHARD_PROFILE") != NULL;
+        const double shard_t0 = shard_profile ? now_sec() : 0.0;
         ok = ds4_gpu_end_commands() != 0;
+        const double shard_t_flush = shard_profile ? now_sec() : 0.0;
 
         int32_t  sel_i32[DS4_N_EXPERT_USED];
         float    ew[DS4_N_EXPERT_USED];
@@ -9711,6 +9714,9 @@ static bool metal_graph_encode_decode_layer(
                          ew, sizeof(ew)) != 0;
         if (ok) ok = ds4_gpu_tensor_read(g->ffn_norm, 0,
                          norm_cpu, sizeof(norm_cpu)) != 0;
+        const double shard_t_read = shard_profile ? now_sec() : 0.0;
+        double shard_t_dispatch = shard_t_read;
+        double shard_t_write = shard_t_read;
 
         if (ok) {
             int sel_int[DS4_N_EXPERT_USED];
@@ -9722,14 +9728,33 @@ static bool metal_graph_encode_decode_layer(
 
             float routed[DS4_N_EMBD];
             memset(routed, 0, sizeof(routed));
-            ds4_shard_pool_dispatch_layer(g_shard_pool, (uint8_t)il,
-                xq, sel_int, ew, DS4_N_EXPERT_USED, routed);
+            ok = ds4_shard_pool_dispatch_layer(g_shard_pool, (uint8_t)il,
+                xq, sel_int, ew, DS4_N_EXPERT_USED, routed) == 0;
+            shard_t_dispatch = shard_profile ? now_sec() : 0.0;
 
             ok = ds4_gpu_tensor_write(g->routed_out, 0,
                      routed, sizeof(routed)) != 0;
+            shard_t_write = shard_profile ? now_sec() : 0.0;
+            if (shard_profile) {
+                fprintf(stderr,
+                        "ds4: expert shard decode profile layer=%u pos=%u flush=%.3f ms read=%.3f ms dispatch=%.3f ms write=%.3f ms",
+                        il,
+                        pos,
+                        (shard_t_flush - shard_t0) * 1000.0,
+                        (shard_t_read - shard_t_flush) * 1000.0,
+                        (shard_t_dispatch - shard_t_read) * 1000.0,
+                        (shard_t_write - shard_t_dispatch) * 1000.0);
+            }
         }
 
         if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (shard_profile) {
+            const double shard_t_resume = now_sec();
+            fprintf(stderr,
+                    " resume=%.3f ms total=%.3f ms\n",
+                    (shard_t_resume - shard_t_write) * 1000.0,
+                    (shard_t_resume - shard_t0) * 1000.0);
+        }
     } else if (ok) {
         ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
@@ -12481,15 +12506,20 @@ static bool metal_graph_encode_layer_ffn_batch(
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
     if (ok && g_shard_pool) {
+        const bool shard_profile = getenv("DS4_EXPERT_SHARD_PROFILE") != NULL;
+        const double shard_t0 = shard_profile ? now_sec() : 0.0;
         ok = ds4_gpu_end_commands() != 0;
+        const double shard_t_flush = shard_profile ? now_sec() : 0.0;
 
         const size_t selected_count = (size_t)n_tokens * DS4_N_EXPERT_USED;
         const size_t activation_count = (size_t)n_tokens * DS4_N_EMBD;
+        const double shard_t_alloc0 = shard_profile ? now_sec() : 0.0;
         int32_t *sel_i32 = ok ? malloc(selected_count * sizeof(*sel_i32)) : NULL;
         float *ew = ok ? malloc(selected_count * sizeof(*ew)) : NULL;
         float *norm_cpu = ok ? malloc(activation_count * sizeof(*norm_cpu)) : NULL;
         float *routed_cpu = ok ? calloc(activation_count, sizeof(*routed_cpu)) : NULL;
         ok = ok && sel_i32 && ew && norm_cpu && routed_cpu;
+        const double shard_t_alloc = shard_profile ? now_sec() : 0.0;
 
         if (ok) ok = ds4_gpu_tensor_read(g->batch_router_selected, 0,
                                          sel_i32, selected_count * sizeof(*sel_i32)) != 0;
@@ -12497,6 +12527,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                          ew, selected_count * sizeof(*ew)) != 0;
         if (ok) ok = ds4_gpu_tensor_read(g->batch_ffn_norm, 0,
                                          norm_cpu, activation_count * sizeof(*norm_cpu)) != 0;
+        const double shard_t_read = shard_profile ? now_sec() : 0.0;
 
         if (ok) {
             for (uint32_t t = 0; t < n_tokens; t++) {
@@ -12521,10 +12552,12 @@ static bool metal_graph_encode_layer_ffn_batch(
                 }
             }
         }
+        const double shard_t_dispatch = shard_profile ? now_sec() : 0.0;
 
         if (ok) ok = ds4_gpu_tensor_write(g->batch_routed_out, 0,
                                           routed_cpu,
                                           activation_count * sizeof(*routed_cpu)) != 0;
+        const double shard_t_write = shard_profile ? now_sec() : 0.0;
 
         free(sel_i32);
         free(ew);
@@ -12532,6 +12565,21 @@ static bool metal_graph_encode_layer_ffn_batch(
         free(routed_cpu);
 
         if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (shard_profile) {
+            const double shard_t_resume = now_sec();
+            fprintf(stderr,
+                    "ds4: expert shard prefill profile layer=%u pos=%u tokens=%u flush=%.3f ms alloc=%.3f ms read=%.3f ms dispatch=%.3f ms write=%.3f ms resume=%.3f ms total=%.3f ms\n",
+                    il,
+                    pos0,
+                    n_tokens,
+                    (shard_t_flush - shard_t0) * 1000.0,
+                    (shard_t_alloc - shard_t_alloc0) * 1000.0,
+                    (shard_t_read - shard_t_alloc) * 1000.0,
+                    (shard_t_dispatch - shard_t_read) * 1000.0,
+                    (shard_t_write - shard_t_dispatch) * 1000.0,
+                    (shard_t_resume - shard_t_write) * 1000.0,
+                    (shard_t_resume - shard_t0) * 1000.0);
+        }
     } else if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
                                              g->batch_routed_gate,
