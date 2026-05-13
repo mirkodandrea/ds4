@@ -17546,45 +17546,76 @@ int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
  * we flatten all tokens' work into a single index space and make ONE call.
  * This eliminates 178 barrier synchronizations per layer (was 181, now 3). */
 
-/* Phase 1: Per-expert-slot descriptor for gate/up + SwiGLU. */
+/* Phase 1: Expert-grouped gate/up + SwiGLU.
+ *
+ * MoE insight: with batch=90 and 6 experts/token, there are 540 expert
+ * activations across 256 experts.  Popular experts may serve 10-20 tokens.
+ * Token-major processing loads each expert's ~2.3MB weights once per token
+ * that uses it.  Expert-major processing loads weights ONCE and computes
+ * all tokens' dot products while weights stay in L3 cache.
+ *
+ * Index space: n_unique_experts * out_dim  (much smaller than total_slots *
+ * out_dim when experts are shared).  For each (expert, row), the worker
+ * loads the weight row once and iterates over all tokens using that expert.
+ */
+
+/* A token that needs a particular expert. */
+typedef struct {
+    const block_q8_K *xq;      /* token's quantized activation */
+    float expert_weight;        /* router weight for this token */
+    int mid_slot;               /* index into mid_all (flat expert slot) */
+} expert_token_ref;
+
+/* A unique expert and all the tokens routed to it. */
 typedef struct {
     const uint8_t *gate_base;
     const uint8_t *up_base;
-    const block_q8_K *xq;
-    float expert_weight;
     uint64_t gate_row_bytes;
     uint64_t up_row_bytes;
-} batch_mid_slot;
+    expert_token_ref *tokens;   /* array of tokens using this expert */
+    int n_tokens;               /* how many tokens use this expert */
+} expert_group;
 
 typedef struct {
-    float *mid;              /* output: mid_all base pointer */
-    const batch_mid_slot *slots;
+    float *mid;                 /* output: mid_all base pointer */
+    const expert_group *groups;
     float clamp;
     uint64_t in_dim;
-    uint64_t out_dim;        /* rows per expert (DS4_N_FF_EXP) */
-    int n_total_slots;
-} batch_mid_ctx;
+    uint64_t out_dim;           /* rows per expert (DS4_N_FF_EXP) */
+    int n_groups;
+} expert_grouped_mid_ctx;
 
-static void batch_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    batch_mid_ctx *ctx = vctx;
+static void expert_grouped_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    expert_grouped_mid_ctx *ctx = vctx;
     const uint64_t od = ctx->out_dim;
+    const float clamp = ctx->clamp;
+    const int in_dim = (int)ctx->in_dim;
 
     for (uint64_t idx = row0; idx < row1; idx++) {
-        const uint64_t slot_idx = idx / od;
-        const uint64_t row = idx - slot_idx * od;
-        const batch_mid_slot *s = &ctx->slots[slot_idx];
+        const uint64_t grp_idx = idx / od;
+        const uint64_t row = idx - grp_idx * od;
+        const expert_group *g = &ctx->groups[grp_idx];
 
-        float gate = 0.0f, up = 0.0f;
-        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(s->gate_base + row * s->gate_row_bytes);
-        const block_iq2_xxs *up_row   = (const block_iq2_xxs *)(s->up_base   + row * s->up_row_bytes);
-        ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, s->xq);
+        /* Load this expert's weight row ONCE — it stays in L1/L2 while we
+         * iterate over all tokens that route to this expert. */
+        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)
+            (g->gate_base + row * g->gate_row_bytes);
+        const block_iq2_xxs *up_row = (const block_iq2_xxs *)
+            (g->up_base + row * g->up_row_bytes);
 
-        if (ctx->clamp > 1.0e-6f) {
-            if (gate >  ctx->clamp) gate =  ctx->clamp;
-            if (up   >  ctx->clamp) up   =  ctx->clamp;
-            if (up   < -ctx->clamp) up   = -ctx->clamp;
+        for (int t = 0; t < g->n_tokens; t++) {
+            const expert_token_ref *ref = &g->tokens[t];
+            float gate = 0.0f, up = 0.0f;
+            ds4_vec_dot_iq2_xxs_pair_q8_K(in_dim, &gate, &up,
+                                           gate_row, up_row, ref->xq);
+            if (clamp > 1.0e-6f) {
+                if (gate >  clamp) gate =  clamp;
+                if (up   >  clamp) up   =  clamp;
+                if (up   < -clamp) up   = -clamp;
+            }
+            ctx->mid[(size_t)ref->mid_slot * od + row] =
+                silu(gate) * up * ref->expert_weight;
         }
-        ctx->mid[idx] = silu(gate) * up * s->expert_weight;
     }
 }
 
@@ -17670,10 +17701,9 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
         return 0;
     }
 
-    /* Single allocation for all intermediate + descriptor buffers. */
+    /* Single allocation for all intermediate buffers. */
     float *mid_all = xmalloc((size_t)total_experts * DS4_N_FF_EXP * sizeof(float));
     block_q8_K *midq = xmalloc((size_t)total_experts * mid_blocks * sizeof(block_q8_K));
-    batch_mid_slot *mid_slots = xmalloc((size_t)total_experts * sizeof(batch_mid_slot));
 
     /* Resolve expert tensor pointers and dimensions once. */
     const ds4_tensor *gate_w = lw->ffn_gate_exps;
@@ -17685,8 +17715,56 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
     uint64_t gate_in_dim = 0, gate_out_dim = 0;
     uint64_t down_in_dim = 0, down_out_dim = 0;
 
-    /* Phase 1 setup: build flat slot descriptors for all active expert slots. */
+    /* Phase 1 setup: build expert groups — group tokens by expert ID so that
+     * each unique expert's weights are loaded from DRAM only once. */
+    expert_token_ref *all_refs = xmalloc((size_t)total_experts * sizeof(expert_token_ref));
+    int expert_count[DS4_N_EXPERT];
+    memset(expert_count, 0, sizeof(expert_count));
+
+    /* First pass: count how many tokens use each expert. */
     int expert_offset = 0;
+    for (int t = 0; t < n_tokens; t++) {
+        const uint8_t n_exp = token_n[t];
+        if (n_exp == 0) continue;
+        const uint16_t *id_row = expert_ids + (size_t)t * (size_t)n_selected;
+        for (int i = 0; i < n_exp; i++)
+            expert_count[id_row[i]]++;
+        expert_offset += n_exp;
+    }
+
+    /* Build unique expert groups. */
+    int n_unique = 0;
+    for (int e2 = 0; e2 < DS4_N_EXPERT; e2++)
+        if (expert_count[e2] > 0) n_unique++;
+
+    expert_group *groups = xmalloc((size_t)n_unique * sizeof(expert_group));
+    int expert_to_group[DS4_N_EXPERT];
+    memset(expert_to_group, -1, sizeof(expert_to_group));
+
+    /* Assign groups and resolve weight pointers. */
+    int gi = 0;
+    int ref_offset = 0;
+    for (int e2 = 0; e2 < DS4_N_EXPERT; e2++) {
+        if (expert_count[e2] == 0) continue;
+        expert_group *g = &groups[gi];
+        uint64_t gin, gout, uin, uout;
+        g->gate_base = tensor_expert_bytes(model, gate_w, (uint32_t)e2,
+                                           &gin, &gout, &g->gate_row_bytes);
+        g->up_base = tensor_expert_bytes(model, up_w, (uint32_t)e2,
+                                         &uin, &uout, &g->up_row_bytes);
+        g->tokens = all_refs + ref_offset;
+        g->n_tokens = 0;  /* filled in next pass */
+        if (gi == 0) {
+            gate_in_dim = gin;
+            gate_out_dim = gout;
+        }
+        expert_to_group[e2] = gi;
+        ref_offset += expert_count[e2];
+        gi++;
+    }
+
+    /* Second pass: populate token refs into their expert groups. */
+    expert_offset = 0;
     for (int t = 0; t < n_tokens; t++) {
         const uint8_t n_exp = token_n[t];
         if (n_exp == 0) continue;
@@ -17697,37 +17775,34 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
         const float *w_row = expert_weights + (size_t)t * (size_t)n_selected;
 
         for (int i = 0; i < n_exp; i++) {
-            batch_mid_slot *s = &mid_slots[expert_offset + i];
-            uint64_t gin, gout, uin, uout;
-            s->gate_base = tensor_expert_bytes(model, gate_w, (uint32_t)id_row[i],
-                                               &gin, &gout, &s->gate_row_bytes);
-            s->up_base = tensor_expert_bytes(model, up_w, (uint32_t)id_row[i],
-                                             &uin, &uout, &s->up_row_bytes);
-            s->xq = xq;
-            s->expert_weight = w_row[i];
-            if (expert_offset + i == 0) {
-                gate_in_dim = gin;
-                gate_out_dim = gout;
-            }
+            int gidx = expert_to_group[id_row[i]];
+            expert_group *g = &groups[gidx];
+            expert_token_ref *ref = &g->tokens[g->n_tokens++];
+            ref->xq = xq;
+            ref->expert_weight = w_row[i];
+            ref->mid_slot = expert_offset + i;
         }
         expert_offset += n_exp;
     }
 
-    /* Phase 1: Gate/up matmul + SwiGLU — ONE parallel_for over all expert slots.
-     * Index space: total_experts * gate_out_dim (e.g., 540 * 2048 = 1,105,920).
-     * Eliminates 89 barrier synchronizations vs per-token approach. */
-    batch_mid_ctx mctx = {
+    /* Phase 1: Gate/up matmul + SwiGLU — expert-grouped parallel_for.
+     * Index space: n_unique_experts * gate_out_dim.  Each weight row is
+     * loaded from DRAM once; inner loop computes all tokens using that expert.
+     * With batch=90: ~160 unique experts instead of 540 slots → fewer rows
+     * to process AND better cache reuse (weights stay in L3 across tokens). */
+    expert_grouped_mid_ctx mctx = {
         .mid = mid_all,
-        .slots = mid_slots,
+        .groups = groups,
         .clamp = DS4_SWIGLU_CLAMP_EXP,
         .in_dim = gate_in_dim,
         .out_dim = gate_out_dim,
-        .n_total_slots = total_experts,
+        .n_groups = n_unique,
     };
-    ds4_parallel_for((uint64_t)total_experts * gate_out_dim,
-                     batch_mid_worker, &mctx);
+    ds4_parallel_for((uint64_t)n_unique * gate_out_dim,
+                     expert_grouped_mid_worker, &mctx);
 
-    free(mid_slots);
+    free(groups);
+    free(all_refs);
 
     /* Phase 2: Quantize ALL expert intermediates in one parallel call. */
     batch_quantize_q8k_ctx qctx = {
