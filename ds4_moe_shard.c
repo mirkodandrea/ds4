@@ -204,6 +204,85 @@ int ds4_shard_dispatch_layer(
     return 0;
 }
 
+/* Batch variant: one request computes one layer for n_tokens activations.
+ * expert_ids/expert_weights are fixed-width rows: n_tokens × n_selected.
+ * token_n_experts[t] indicates how many entries in each row are valid. */
+static int ds4_shard_dispatch_layer_batch(
+    ds4_shard        *s,
+    uint8_t           layer,
+    const void       *xq_batch,        /* n_tokens × DS4_SHARD_Q8K_BYTES */
+    const uint16_t   *expert_ids,      /* n_tokens × n_selected */
+    const float      *expert_weights,  /* n_tokens × n_selected */
+    const uint8_t    *token_n_experts, /* n_tokens */
+    int               n_tokens,
+    int               n_selected,
+    float            *out_batch)       /* n_tokens × DS4_SHARD_N_EMBD */
+{
+    if (n_tokens <= 0 || n_selected <= 0 || n_selected > DS4_SHARD_N_EXPERT_USED) return -1;
+    const int profile = shard_profile_enabled();
+    const double t0 = profile ? shard_now_sec() : 0.0;
+
+    uint8_t hdr[DS4_SHARD_BATCH_REQ_HDR_SIZE];
+    uint32_t magic = DS4_SHARD_MAGIC;
+    memcpy(hdr, &magic, 4);
+    hdr[4] = DS4_SHARD_CMD_EXPERT_BATCH;
+    hdr[5] = layer;
+    hdr[6] = DS4_SHARD_FLAG_Q8K;
+    hdr[7] = 0;
+    uint16_t n_tok_u16 = (uint16_t)n_tokens;
+    uint16_t n_sel_u16 = (uint16_t)n_selected;
+    memcpy(hdr + 8, &n_tok_u16, sizeof(n_tok_u16));
+    memcpy(hdr + 10, &n_sel_u16, sizeof(n_sel_u16));
+
+    if (full_send(s->fd, hdr, sizeof(hdr)) != 0) return -1;
+    for (int t = 0; t < n_tokens; t++) {
+        const uint32_t token_hdr =
+            ((uint32_t)token_n_experts[t] & 0xFFu);
+        if (full_send(s->fd, &token_hdr, sizeof(token_hdr)) != 0) return -1;
+        if (full_send(s->fd,
+                      expert_ids + (size_t)t * (size_t)n_selected,
+                      (size_t)n_selected * sizeof(uint16_t)) != 0) return -1;
+        if (full_send(s->fd,
+                      expert_weights + (size_t)t * (size_t)n_selected,
+                      (size_t)n_selected * sizeof(float)) != 0) return -1;
+        if (full_send(s->fd,
+                      (const uint8_t *)xq_batch + (size_t)t * DS4_SHARD_Q8K_BYTES,
+                      DS4_SHARD_Q8K_BYTES) != 0) return -1;
+    }
+    const double t_sent = profile ? shard_now_sec() : 0.0;
+
+    uint8_t rsp_hdr[DS4_SHARD_BATCH_RSP_HDR_SIZE];
+    if (full_recv(s->fd, rsp_hdr, sizeof(rsp_hdr)) != 0) return -1;
+    const double t_rsp_hdr = profile ? shard_now_sec() : 0.0;
+
+    uint32_t rsp_magic;
+    memcpy(&rsp_magic, rsp_hdr, 4);
+    if (rsp_magic != DS4_SHARD_MAGIC) return -1;
+    if (rsp_hdr[4] != DS4_SHARD_STATUS_OK) return -1;
+    uint16_t rsp_n_tok = 0;
+    memcpy(&rsp_n_tok, rsp_hdr + 8, sizeof(rsp_n_tok));
+    if ((int)rsp_n_tok != n_tokens) return -1;
+
+    const size_t out_bytes = (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(float);
+    if (full_recv(s->fd, out_batch, out_bytes) != 0) return -1;
+
+    if (profile) {
+        const double t_done = shard_now_sec();
+        fprintf(stderr,
+                "ds4_moe_shard: batch profile host=%s:%u layer=%u tokens=%d selected=%d send=%.3f ms wait_hdr=%.3f ms recv_out=%.3f ms total=%.3f ms\n",
+                s->host,
+                s->port,
+                layer,
+                n_tokens,
+                n_selected,
+                (t_sent - t0) * 1000.0,
+                (t_rsp_hdr - t_sent) * 1000.0,
+                (t_done - t_rsp_hdr) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
+    return 0;
+}
+
 /* ---- shard pool: parallel fan-out -------------------------------------- */
 
 typedef struct {
@@ -411,6 +490,97 @@ int ds4_shard_pool_dispatch_layer(
                 n_selected,
                 (t_signaled - t0) * 1000.0,
                 (t_done - t_signaled) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
+    return 0;
+}
+
+int ds4_shard_pool_dispatch_layer_batch(
+    ds4_shard_pool   *p,
+    uint8_t           layer,
+    const void       *xq,
+    const int        *selected,
+    const float      *weights,
+    int               n_tokens,
+    int               n_selected,
+    float            *out)
+{
+    if (!p || !xq || !selected || !weights || !out) return -1;
+    if (n_tokens <= 0 || n_selected <= 0 || n_selected > DS4_SHARD_N_EXPERT_USED) return -1;
+
+    const int profile = shard_profile_enabled();
+    const double t0 = profile ? shard_now_sec() : 0.0;
+    memset(out, 0, (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(float));
+
+    uint8_t *token_n = malloc((size_t)n_tokens * sizeof(*token_n));
+    uint16_t *ids = malloc((size_t)n_tokens * (size_t)n_selected * sizeof(*ids));
+    float *wts = malloc((size_t)n_tokens * (size_t)n_selected * sizeof(*wts));
+    float *partial = malloc((size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(*partial));
+    if (!token_n || !ids || !wts || !partial) {
+        free(token_n);
+        free(ids);
+        free(wts);
+        free(partial);
+        return -1;
+    }
+
+    for (int si = 0; si < p->n_shards; si++) {
+        shard_worker *w = &p->workers[si];
+        int any = 0;
+        for (int t = 0; t < n_tokens; t++) {
+            int k = 0;
+            const int *sel_row = selected + (size_t)t * (size_t)n_selected;
+            const float *wt_row = weights + (size_t)t * (size_t)n_selected;
+            uint16_t *id_row = ids + (size_t)t * (size_t)n_selected;
+            float *w_row = wts + (size_t)t * (size_t)n_selected;
+            for (int ei = 0; ei < n_selected; ei++) {
+                if (ds4_shard_owns(w->shard, sel_row[ei])) {
+                    id_row[k] = (uint16_t)sel_row[ei];
+                    w_row[k] = wt_row[ei];
+                    k++;
+                }
+            }
+            token_n[t] = (uint8_t)k;
+            for (int j = k; j < n_selected; j++) {
+                id_row[j] = 0;
+                w_row[j] = 0.0f;
+            }
+            if (k > 0) any = 1;
+        }
+
+        if (!any) continue;
+        if (ds4_shard_dispatch_layer_batch(w->shard,
+                                           layer,
+                                           xq,
+                                           ids,
+                                           wts,
+                                           token_n,
+                                           n_tokens,
+                                           n_selected,
+                                           partial) != 0) {
+            free(token_n);
+            free(ids);
+            free(wts);
+            free(partial);
+            return -1;
+        }
+        const size_t count = (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD;
+        for (size_t i = 0; i < count; i++) out[i] += partial[i];
+    }
+
+    free(token_n);
+    free(ids);
+    free(wts);
+    free(partial);
+
+    if (profile) {
+        const double t_done = shard_now_sec();
+        fprintf(stderr,
+                "ds4_moe_shard: pool batch profile layer=%u shards=%d tokens=%d selected=%d total=%.3f ms\n",
+                layer,
+                p->n_shards,
+                n_tokens,
+                n_selected,
                 (t_done - t0) * 1000.0);
     }
     return 0;

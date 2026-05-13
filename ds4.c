@@ -12690,27 +12690,27 @@ static bool metal_graph_encode_layer_ffn_batch(
         const double shard_t_read = shard_profile ? now_sec() : 0.0;
 
         if (ok) {
-            for (uint32_t t = 0; t < n_tokens; t++) {
-                int sel_int[DS4_N_EXPERT_USED];
-                for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
-                    sel_int[i] = (int)sel_i32[(size_t)t * DS4_N_EXPERT_USED + i];
+            const size_t xq_count = (size_t)n_tokens * (size_t)(DS4_N_EMBD / 256);
+            block_q8_K *xq_all = malloc(xq_count * sizeof(*xq_all));
+            ok = xq_all != NULL;
+            if (ok) {
+                for (uint32_t t = 0; t < n_tokens; t++) {
+                    ds4_quantize_row_q8_K(norm_cpu + (size_t)t * DS4_N_EMBD,
+                                          xq_all + (size_t)t * (size_t)(DS4_N_EMBD / 256),
+                                          DS4_N_EMBD);
                 }
-
-                block_q8_K xq[DS4_N_EMBD / 256];
-                ds4_quantize_row_q8_K(norm_cpu + (size_t)t * DS4_N_EMBD,
-                                      xq,
-                                      DS4_N_EMBD);
-                if (ds4_shard_pool_dispatch_layer(g_shard_pool,
-                                                   (uint8_t)il,
-                                                   xq,
-                                                   sel_int,
-                                                   ew + (size_t)t * DS4_N_EXPERT_USED,
-                                                   DS4_N_EXPERT_USED,
-                                                   routed_cpu + (size_t)t * DS4_N_EMBD) != 0) {
+                if (ds4_shard_pool_dispatch_layer_batch(g_shard_pool,
+                                                        (uint8_t)il,
+                                                        xq_all,
+                                                        (const int *)sel_i32,
+                                                        ew,
+                                                        (int)n_tokens,
+                                                        DS4_N_EXPERT_USED,
+                                                        routed_cpu) != 0) {
                     ok = false;
-                    break;
                 }
             }
+            free(xq_all);
         }
         const double shard_t_dispatch = shard_profile ? now_sec() : 0.0;
 

@@ -20,6 +20,7 @@
 #define DS4_SHARD_MAGIC        0x44533445u  /* "DS4E" little-endian */
 #define DS4_SHARD_CMD_PING     0x00
 #define DS4_SHARD_CMD_EXPERT   0x01
+#define DS4_SHARD_CMD_EXPERT_BATCH 0x02
 #define DS4_SHARD_CMD_SHUTDOWN 0xFF
 
 #define DS4_SHARD_STATUS_OK    0x00
@@ -63,6 +64,11 @@
 #define DS4_SHARD_REQ_HDR_SIZE  8   /* magic(4) + cmd(1) + layer(1) + n_expert(1) + flags(1) */
 #define DS4_SHARD_RSP_HDR_SIZE  8   /* magic(4) + status(1) + layer(1) + pad(2) */
 #define DS4_SHARD_FLAG_Q8K      0x01
+/* Batch request/response headers.
+ * req: magic(4) + cmd(1) + layer(1) + flags(1) + pad(1) + n_tokens(2) + n_selected(2)
+ * rsp: magic(4) + status(1) + layer(1) + pad(2) + n_tokens(2) + pad(2) */
+#define DS4_SHARD_BATCH_REQ_HDR_SIZE 12
+#define DS4_SHARD_BATCH_RSP_HDR_SIZE 12
 
 /* ---- Single shard connection ------------------------------------------- */
 
@@ -109,6 +115,19 @@ int ds4_shard_pool_dispatch_layer(
     const void       *xq,
     const int        *selected,       /* DS4_SHARD_N_EXPERT_USED expert IDs */
     const float      *weights,        /* DS4_SHARD_N_EXPERT_USED weights */
+    int               n_selected,
+    float            *out);
+
+/* Layer-batch dispatch. selected/weights are laid out as n_tokens rows, each
+ * with n_selected entries. xq is n_tokens consecutive Q8_K activations.
+ * out is n_tokens consecutive DS4_SHARD_N_EMBD float rows. */
+int ds4_shard_pool_dispatch_layer_batch(
+    ds4_shard_pool   *p,
+    uint8_t           layer,
+    const void       *xq,
+    const int        *selected,
+    const float      *weights,
+    int               n_tokens,
     int               n_selected,
     float            *out);
 

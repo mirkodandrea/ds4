@@ -88,6 +88,25 @@ static void send_response(int fd, uint8_t status, uint8_t layer,
     }
 }
 
+static void send_batch_response(int fd, uint8_t status, uint8_t layer,
+                                uint16_t n_tokens, const float *out) {
+    uint8_t hdr[DS4_SHARD_BATCH_RSP_HDR_SIZE];
+    uint32_t magic = DS4_SHARD_MAGIC;
+    memcpy(hdr, &magic, 4);
+    hdr[4] = status;
+    hdr[5] = layer;
+    hdr[6] = 0;
+    hdr[7] = 0;
+    memcpy(hdr + 8, &n_tokens, sizeof(n_tokens));
+    hdr[10] = 0;
+    hdr[11] = 0;
+    full_send(fd, hdr, sizeof(hdr));
+    if (status == DS4_SHARD_STATUS_OK && out && n_tokens > 0) {
+        full_send(fd, out,
+                  (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(float));
+    }
+}
+
 static void handle_connection(int cfd, ds4_engine *engine,
                               uint16_t expert_start, uint16_t expert_end) {
     uint8_t hdr[DS4_SHARD_REQ_HDR_SIZE];
@@ -122,6 +141,110 @@ static void handle_connection(int cfd, ds4_engine *engine,
         }
 
         if (cmd != DS4_SHARD_CMD_EXPERT) {
+            if (cmd == DS4_SHARD_CMD_EXPERT_BATCH) {
+                uint8_t tail[4];
+                if (full_recv(cfd, tail, sizeof(tail)) != 0) break;
+                uint16_t n_tokens = 0;
+                uint16_t n_selected = 0;
+                memcpy(&n_tokens, tail, sizeof(n_tokens));
+                memcpy(&n_selected, tail + 2, sizeof(n_selected));
+                uint8_t layer = hdr[5];
+                uint8_t flags = hdr[6];
+                if (layer >= DS4_SHARD_N_LAYER ||
+                    n_tokens == 0 ||
+                    n_selected == 0 ||
+                    n_selected > DS4_SHARD_N_EXPERT_USED ||
+                    !(flags & DS4_SHARD_FLAG_Q8K)) {
+                    send_batch_response(cfd, DS4_SHARD_STATUS_ERR, layer, n_tokens, NULL);
+                    continue;
+                }
+
+                const size_t token_rows = (size_t)n_tokens * (size_t)n_selected;
+                uint8_t *token_n = malloc((size_t)n_tokens * sizeof(*token_n));
+                uint16_t *ids = malloc(token_rows * sizeof(*ids));
+                float *wts = malloc(token_rows * sizeof(*wts));
+                uint8_t *xq_all = malloc((size_t)n_tokens * DS4_SHARD_Q8K_BYTES);
+                float *out_all = malloc((size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(*out_all));
+                if (!token_n || !ids || !wts || !xq_all || !out_all) {
+                    free(token_n);
+                    free(ids);
+                    free(wts);
+                    free(xq_all);
+                    free(out_all);
+                    send_batch_response(cfd, DS4_SHARD_STATUS_ERR, layer, n_tokens, NULL);
+                    continue;
+                }
+
+                bool ok_batch = true;
+                for (uint16_t t = 0; t < n_tokens && ok_batch; t++) {
+                    uint32_t token_hdr = 0;
+                    if (full_recv(cfd, &token_hdr, sizeof(token_hdr)) != 0) { ok_batch = false; break; }
+                    token_n[t] = (uint8_t)(token_hdr & 0xFFu);
+                    if (token_n[t] > n_selected) { ok_batch = false; break; }
+
+                    uint16_t *id_row = ids + (size_t)t * (size_t)n_selected;
+                    float *w_row = wts + (size_t)t * (size_t)n_selected;
+                    if (full_recv(cfd, id_row, (size_t)n_selected * sizeof(uint16_t)) != 0) { ok_batch = false; break; }
+                    if (full_recv(cfd, w_row, (size_t)n_selected * sizeof(float)) != 0) { ok_batch = false; break; }
+                    if (full_recv(cfd,
+                                  xq_all + (size_t)t * DS4_SHARD_Q8K_BYTES,
+                                  DS4_SHARD_Q8K_BYTES) != 0) { ok_batch = false; break; }
+
+                    for (uint8_t i = 0; i < token_n[t]; i++) {
+                        if (id_row[i] < expert_start || id_row[i] >= expert_end) {
+                            ok_batch = false;
+                            break;
+                        }
+                    }
+                }
+                const double t_recv = profile ? server_now_sec() : 0.0;
+
+                for (uint16_t t = 0; t < n_tokens && ok_batch; t++) {
+                    float *out_row = out_all + (size_t)t * (size_t)DS4_SHARD_N_EMBD;
+                    if (token_n[t] == 0) {
+                        memset(out_row, 0, (size_t)DS4_SHARD_N_EMBD * sizeof(float));
+                        continue;
+                    }
+                    const uint16_t *id_row = ids + (size_t)t * (size_t)n_selected;
+                    const float *w_row = wts + (size_t)t * (size_t)n_selected;
+                    if (ds4_engine_compute_experts(engine,
+                                                   layer,
+                                                   xq_all + (size_t)t * DS4_SHARD_Q8K_BYTES,
+                                                   id_row,
+                                                   w_row,
+                                                   token_n[t],
+                                                   out_row) != 0) {
+                        ok_batch = false;
+                        break;
+                    }
+                }
+                const double t_compute = profile ? server_now_sec() : 0.0;
+
+                if (!ok_batch) {
+                    send_batch_response(cfd, DS4_SHARD_STATUS_ERR, layer, n_tokens, NULL);
+                } else {
+                    send_batch_response(cfd, DS4_SHARD_STATUS_OK, layer, n_tokens, out_all);
+                }
+                if (profile) {
+                    const double t_done = server_now_sec();
+                    fprintf(stderr,
+                            "expert-server: batch profile layer=%u tokens=%u selected=%u recv=%.3f ms compute=%.3f ms send=%.3f ms total=%.3f ms\n",
+                            layer,
+                            n_tokens,
+                            n_selected,
+                            (t_recv - t0) * 1000.0,
+                            (t_compute - t_recv) * 1000.0,
+                            (t_done - t_compute) * 1000.0,
+                            (t_done - t0) * 1000.0);
+                }
+
+                free(token_n);
+                free(ids);
+                free(wts);
+                free(xq_all);
+                free(out_all);
+                continue;
+            }
             fprintf(stderr, "expert-server: unknown command 0x%02x\n", cmd);
             send_response(cfd, DS4_SHARD_STATUS_ERR, 0, NULL);
             break;
