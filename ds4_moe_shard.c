@@ -196,18 +196,16 @@ int ds4_shard_dispatch_layer(
     if (send_rc != 0) return -1;
     const double t_sent = profile ? shard_now_sec() : 0.0;
 
-    /* Read response header + output in one coalesced recv. */
-    uint8_t rsp_buf[DS4_SHARD_RSP_HDR_SIZE + DS4_SHARD_N_EMBD * sizeof(float)];
-    if (full_recv(s->fd, rsp_buf, sizeof(rsp_buf)) != 0) return -1;
-    const double t_recv = profile ? shard_now_sec() : 0.0;
+    /* Read response header, then output data directly into caller's buffer. */
+    uint8_t rsp_hdr[DS4_SHARD_RSP_HDR_SIZE];
+    if (full_recv(s->fd, rsp_hdr, sizeof(rsp_hdr)) != 0) return -1;
 
     uint32_t rsp_magic;
-    memcpy(&rsp_magic, rsp_buf, 4);
+    memcpy(&rsp_magic, rsp_hdr, 4);
     if (rsp_magic != DS4_SHARD_MAGIC) return -1;
-    if (rsp_buf[4] != DS4_SHARD_STATUS_OK) return -1;
+    if (rsp_hdr[4] != DS4_SHARD_STATUS_OK) return -1;
 
-    memcpy(out, rsp_buf + DS4_SHARD_RSP_HDR_SIZE,
-           (size_t)DS4_SHARD_N_EMBD * sizeof(float));
+    if (full_recv(s->fd, out, (size_t)DS4_SHARD_N_EMBD * sizeof(float)) != 0) return -1;
     if (profile) {
         const double t_done = shard_now_sec();
         fprintf(stderr,
@@ -217,7 +215,7 @@ int ds4_shard_dispatch_layer(
                 layer,
                 n_experts,
                 (t_sent - t0) * 1000.0,
-                (t_recv - t_sent) * 1000.0,
+                (t_done - t_sent) * 1000.0,
                 (t_done - t0) * 1000.0);
     }
     return 0;
