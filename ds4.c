@@ -16666,6 +16666,59 @@ static void model_madvise_tensors(const ds4_model *m, bool expert, int advice) {
 #endif
 }
 
+#ifndef DS4_NO_GPU
+static int compare_model_ranges(const void *a, const void *b) {
+    const ds4_gpu_model_range *ra = (const ds4_gpu_model_range *)a;
+    const ds4_gpu_model_range *rb = (const ds4_gpu_model_range *)b;
+    if (ra->offset < rb->offset) return -1;
+    if (ra->offset > rb->offset) return 1;
+    return 0;
+}
+
+static ds4_gpu_model_range *model_non_expert_ranges(const ds4_model *m, uint32_t *out_n) {
+    *out_n = 0;
+    ds4_gpu_model_range *ranges = calloc((size_t)m->n_tensors, sizeof(ranges[0]));
+    if (!ranges) return NULL;
+
+    uint32_t n = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0 || is_routed_expert_tensor(t)) continue;
+        ranges[n].offset = t->abs_offset;
+        ranges[n].size = t->bytes;
+        n++;
+    }
+    if (n == 0) {
+        free(ranges);
+        return NULL;
+    }
+
+    qsort(ranges, n, sizeof(ranges[0]), compare_model_ranges);
+
+    const uint64_t max_small_gap = m->alignment > 4096 ? m->alignment : 4096;
+    uint32_t w = 0;
+    for (uint32_t r = 0; r < n; r++) {
+        const uint64_t start = ranges[r].offset;
+        const uint64_t end = start + ranges[r].size;
+        if (w == 0) {
+            ranges[w++] = ranges[r];
+            continue;
+        }
+
+        ds4_gpu_model_range *cur = &ranges[w - 1];
+        const uint64_t cur_end = cur->offset + cur->size;
+        if (start <= cur_end || start - cur_end <= max_small_gap) {
+            if (end > cur_end) cur->size = end - cur->offset;
+        } else {
+            ranges[w++] = ranges[r];
+        }
+    }
+
+    *out_n = w;
+    return ranges;
+}
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -16781,11 +16834,31 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                     (double)other_bytes / (1024.0 * 1024.0 * 1024.0));
         }
 
-        if (!ds4_gpu_set_model_map_range(e->model.map,
-                                           e->model.size,
-                                           e->model.tensor_data_pos,
-                                           e->model.size - e->model.tensor_data_pos))
-        {
+        int model_mapped = 0;
+        if (opt->expert_shards && opt->expert_shards[0]) {
+            uint32_t n_ranges = 0;
+            ds4_gpu_model_range *ranges = model_non_expert_ranges(&e->model, &n_ranges);
+            if (ranges) {
+                uint64_t mapped_bytes = 0;
+                for (uint32_t i = 0; i < n_ranges; i++) mapped_bytes += ranges[i].size;
+                fprintf(stderr,
+                        "ds4: expert shard mode — mapping %.2f GiB of non-expert tensor spans to Metal across %u ranges\n",
+                        (double)mapped_bytes / (1024.0 * 1024.0 * 1024.0),
+                        n_ranges);
+                model_mapped = ds4_gpu_set_model_map_ranges(e->model.map,
+                                                            e->model.size,
+                                                            ranges,
+                                                            n_ranges);
+                free(ranges);
+            }
+        } else {
+            model_mapped = ds4_gpu_set_model_map_range(e->model.map,
+                                                       e->model.size,
+                                                       e->model.tensor_data_pos,
+                                                       e->model.size - e->model.tensor_data_pos);
+        }
+
+        if (!model_mapped) {
             fprintf(stderr,
                     "ds4: %s failed to map model views; aborting startup. "
                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",

@@ -36,6 +36,11 @@ int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
+typedef struct {
+    uint64_t offset;
+    uint64_t size;
+} ds4_gpu_model_range;
+int ds4_gpu_set_model_map_ranges(const void *model_map, uint64_t model_size, const ds4_gpu_model_range *ranges, uint32_t n_ranges);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);

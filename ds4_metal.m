@@ -490,6 +490,15 @@ static int ds4_gpu_map_model_views(
         off += step;
     }
 
+    fprintf(stderr,
+            "ds4: Metal model view range created in %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
+            ds4_gpu_now_ms() - t0,
+            mapped_model_size / 1024.0 / 1024.0,
+            page_model_offset / 1024.0 / 1024.0);
+    return 1;
+}
+
+static int ds4_gpu_finish_model_view_mapping(double t0) {
     const double t_mapped = ds4_gpu_now_ms();
     const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
     if (request_residency) ds4_gpu_progress_begin("requesting Metal residency (may take tens of seconds)");
@@ -520,14 +529,89 @@ static int ds4_gpu_map_model_views(
     }
     const double t_warm = ds4_gpu_now_ms();
     fprintf(stderr,
-            "ds4: Metal model views created in %.3f ms, residency requested in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
+            "ds4: Metal model views finalized in %.3f ms, residency requested in %.3f ms, warmup %.3f ms\n",
             t_mapped - t0,
             t_resident - t_mapped,
-            t_warm - t_warm0,
-            mapped_model_size / 1024.0 / 1024.0,
-            page_model_offset / 1024.0 / 1024.0);
+            t_warm - t_warm0);
     if (!warmed) return 0;
     return 1;
+}
+
+static int ds4_gpu_model_views_cover_ranges(
+        const void                  *model_map,
+        uint64_t                     model_size,
+        const ds4_gpu_model_range   *ranges,
+        uint32_t                     n_ranges) {
+    for (uint32_t r = 0; r < n_ranges; r++) {
+        const uint64_t start = ranges[r].offset;
+        const uint64_t end = start + ranges[r].size;
+        int covered = 0;
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            if (g_model_views[i].model_map != model_map ||
+                g_model_views[i].model_size != model_size) {
+                continue;
+            }
+            const uint64_t view_start = g_model_views[i].model_offset;
+            const uint64_t view_end = view_start + g_model_views[i].bytes;
+            if (start >= view_start && end <= view_end) {
+                covered = 1;
+                break;
+            }
+        }
+        if (!covered) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_set_model_map_ranges(
+        const void                *model_map,
+        uint64_t                   model_size,
+        const ds4_gpu_model_range *ranges,
+        uint32_t                   n_ranges) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || model_size == 0 || !ranges || n_ranges == 0) return 0;
+    for (uint32_t i = 0; i < n_ranges; i++) {
+        if (ranges[i].offset > model_size ||
+            ranges[i].size == 0 ||
+            ranges[i].size > model_size - ranges[i].offset) {
+            return 0;
+        }
+    }
+
+    @autoreleasepool {
+        if (ds4_gpu_model_views_cover_ranges(model_map, model_size, ranges, n_ranges)) return 1;
+
+        const double t0 = ds4_gpu_now_ms();
+        ds4_gpu_model_residency_clear();
+        g_model_map_ptr = model_map;
+        g_model_map_size = model_size;
+        g_model_mapped_offset = ranges[0].offset;
+        g_model_mapped_size = 0;
+        for (uint32_t i = 0; i < n_ranges; i++) {
+            if (!ds4_gpu_map_model_views(model_map, model_size, ranges[i].offset, ranges[i].size)) {
+                ds4_gpu_model_residency_clear();
+                return 0;
+            }
+            g_model_mapped_size += ranges[i].size;
+        }
+        if (!ds4_gpu_finish_model_view_mapping(t0)) {
+            ds4_gpu_model_residency_clear();
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4: Metal mapped mmaped model as %u overlapping shared buffers across %u ranges\n",
+                g_model_view_count,
+                n_ranges);
+        return 1;
+    }
+}
+
+static int ds4_gpu_set_model_map_range_impl(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
+    const ds4_gpu_model_range range = {
+        .offset = map_offset,
+        .size = map_size,
+    };
+    return ds4_gpu_set_model_map_ranges(model_map, model_size, &range, 1);
 }
 
 static id<MTLBuffer> ds4_gpu_new_transient_buffer(NSUInteger bytes, const char *label) {
@@ -4358,34 +4442,7 @@ int ds4_gpu_embed_tokens_hc_tensor(
 }
 
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
-    if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!model_map || model_size == 0) return 0;
-    if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
-
-    @autoreleasepool {
-        for (uint32_t i = 0; i < g_model_view_count; i++) {
-            if (g_model_views[i].model_map == model_map &&
-                g_model_views[i].model_size == model_size &&
-                map_offset >= g_model_views[i].model_offset &&
-                map_offset + map_size <= g_model_views[i].model_offset + g_model_views[i].bytes) {
-                return 1;
-            }
-        }
-
-        ds4_gpu_model_residency_clear();
-        g_model_map_ptr = model_map;
-        g_model_map_size = model_size;
-        g_model_mapped_offset = map_offset;
-        g_model_mapped_size = map_size;
-        if (!ds4_gpu_map_model_views(model_map, model_size, map_offset, map_size)) {
-            ds4_gpu_model_residency_clear();
-            return 0;
-        }
-        fprintf(stderr,
-                "ds4: Metal mapped mmaped model as %u overlapping shared buffers\n",
-                g_model_view_count);
-        return 1;
-    }
+    return ds4_gpu_set_model_map_range_impl(model_map, model_size, map_offset, map_size);
 }
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
