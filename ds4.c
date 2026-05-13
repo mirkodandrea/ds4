@@ -516,6 +516,113 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+typedef struct {
+    ds4_shard_pool *pool;
+    uint8_t         layer;
+    block_q8_K      xq[DS4_N_EMBD / QK_K];
+    int             selected[DS4_N_EXPERT_USED];
+    float           weights[DS4_N_EXPERT_USED];
+    int             n_selected;
+    float           routed[DS4_N_EMBD];
+    int             result;
+    bool            done;
+    bool            profile;
+    double          dispatch_start;
+    double          dispatch_done;
+} ds4_decode_shard_job;
+
+static pthread_t       g_decode_shard_thread;
+static pthread_mutex_t g_decode_shard_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_decode_shard_cond = PTHREAD_COND_INITIALIZER;
+static ds4_decode_shard_job *g_decode_shard_job = NULL;
+static bool g_decode_shard_thread_started = false;
+static bool g_decode_shard_shutdown = false;
+
+static void *ds4_decode_shard_worker_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_decode_shard_mutex);
+        while (!g_decode_shard_job && !g_decode_shard_shutdown) {
+            pthread_cond_wait(&g_decode_shard_cond, &g_decode_shard_mutex);
+        }
+        if (!g_decode_shard_job && g_decode_shard_shutdown) {
+            pthread_mutex_unlock(&g_decode_shard_mutex);
+            return NULL;
+        }
+        ds4_decode_shard_job *job = g_decode_shard_job;
+        pthread_mutex_unlock(&g_decode_shard_mutex);
+
+        job->dispatch_start = job->profile ? now_sec() : 0.0;
+        const int result = ds4_shard_pool_dispatch_layer(job->pool,
+                                                         job->layer,
+                                                         job->xq,
+                                                         job->selected,
+                                                         job->weights,
+                                                         job->n_selected,
+                                                         job->routed);
+        job->dispatch_done = job->profile ? now_sec() : 0.0;
+
+        pthread_mutex_lock(&g_decode_shard_mutex);
+        job->result = result;
+        job->done = true;
+        if (g_decode_shard_job == job) g_decode_shard_job = NULL;
+        pthread_cond_broadcast(&g_decode_shard_cond);
+        pthread_mutex_unlock(&g_decode_shard_mutex);
+    }
+}
+
+static void ds4_decode_shard_worker_start(ds4_decode_shard_job *job) {
+    pthread_mutex_lock(&g_decode_shard_mutex);
+    if (!g_decode_shard_thread_started) {
+        g_decode_shard_shutdown = false;
+        if (pthread_create(&g_decode_shard_thread, NULL,
+                           ds4_decode_shard_worker_main, NULL) != 0) {
+            pthread_mutex_unlock(&g_decode_shard_mutex);
+            ds4_die("failed to create decode shard worker thread");
+        }
+        g_decode_shard_thread_started = true;
+    }
+    while (g_decode_shard_job != NULL) {
+        pthread_cond_wait(&g_decode_shard_cond, &g_decode_shard_mutex);
+    }
+    job->result = -1;
+    job->done = false;
+    job->dispatch_start = 0.0;
+    job->dispatch_done = 0.0;
+    g_decode_shard_job = job;
+    pthread_cond_signal(&g_decode_shard_cond);
+    pthread_mutex_unlock(&g_decode_shard_mutex);
+}
+
+static int ds4_decode_shard_worker_wait(ds4_decode_shard_job *job) {
+    pthread_mutex_lock(&g_decode_shard_mutex);
+    while (!job->done) {
+        pthread_cond_wait(&g_decode_shard_cond, &g_decode_shard_mutex);
+    }
+    const int result = job->result;
+    pthread_mutex_unlock(&g_decode_shard_mutex);
+    return result;
+}
+
+static void ds4_decode_shard_worker_shutdown(void) {
+    pthread_mutex_lock(&g_decode_shard_mutex);
+    if (!g_decode_shard_thread_started) {
+        pthread_mutex_unlock(&g_decode_shard_mutex);
+        return;
+    }
+    g_decode_shard_shutdown = true;
+    pthread_cond_signal(&g_decode_shard_cond);
+    pthread_mutex_unlock(&g_decode_shard_mutex);
+
+    pthread_join(g_decode_shard_thread, NULL);
+
+    pthread_mutex_lock(&g_decode_shard_mutex);
+    g_decode_shard_thread_started = false;
+    g_decode_shard_shutdown = false;
+    g_decode_shard_job = NULL;
+    pthread_mutex_unlock(&g_decode_shard_mutex);
+}
+
 static const char *ds4_log_color_code(ds4_log_type type) {
     switch (type) {
     case DS4_LOG_PREFILL:
@@ -9693,16 +9800,23 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
+
+    ds4_decode_shard_job shard_job;
+    bool shard_job_active = false;
+    const bool shard_profile = g_shard_pool && getenv("DS4_EXPERT_SHARD_PROFILE") != NULL;
+    double shard_t0 = 0.0;
+    double shard_t_flush = 0.0;
+    double shard_t_read = 0.0;
+    double shard_t_quant = 0.0;
+    double shard_t_signal = 0.0;
+    double shard_t_resume = 0.0;
+
     if (ok && g_shard_pool) {
-        /* Remote expert dispatch: GPU→CPU bounce.
-         * Flush pending GPU commands (attention + routing) so that
-         * router_selected, router_weights and ffn_norm are readable.
-         * Read results, quantize, dispatch to remote shards, write
-         * routed_out back, then resume GPU command encoding. */
-        const bool shard_profile = getenv("DS4_EXPERT_SHARD_PROFILE") != NULL;
-        const double shard_t0 = shard_profile ? now_sec() : 0.0;
+        /* Remote expert dispatch: flush just enough state for the shard,
+         * then let the TCP work run while Metal computes the shared expert. */
+        shard_t0 = shard_profile ? now_sec() : 0.0;
         ok = ds4_gpu_end_commands() != 0;
-        const double shard_t_flush = shard_profile ? now_sec() : 0.0;
+        shard_t_flush = shard_profile ? now_sec() : 0.0;
 
         int32_t  sel_i32[DS4_N_EXPERT_USED];
         float    ew[DS4_N_EXPERT_USED];
@@ -9714,46 +9828,27 @@ static bool metal_graph_encode_decode_layer(
                          ew, sizeof(ew)) != 0;
         if (ok) ok = ds4_gpu_tensor_read(g->ffn_norm, 0,
                          norm_cpu, sizeof(norm_cpu)) != 0;
-        const double shard_t_read = shard_profile ? now_sec() : 0.0;
-        double shard_t_dispatch = shard_t_read;
-        double shard_t_write = shard_t_read;
+        shard_t_read = shard_profile ? now_sec() : 0.0;
 
         if (ok) {
-            int sel_int[DS4_N_EXPERT_USED];
-            for (int i = 0; i < DS4_N_EXPERT_USED; i++)
-                sel_int[i] = (int)sel_i32[i];
-
-            block_q8_K xq[DS4_N_EMBD / 256];
-            ds4_quantize_row_q8_K(norm_cpu, xq, DS4_N_EMBD);
-
-            float routed[DS4_N_EMBD];
-            memset(routed, 0, sizeof(routed));
-            ok = ds4_shard_pool_dispatch_layer(g_shard_pool, (uint8_t)il,
-                xq, sel_int, ew, DS4_N_EXPERT_USED, routed) == 0;
-            shard_t_dispatch = shard_profile ? now_sec() : 0.0;
-
-            ok = ds4_gpu_tensor_write(g->routed_out, 0,
-                     routed, sizeof(routed)) != 0;
-            shard_t_write = shard_profile ? now_sec() : 0.0;
-            if (shard_profile) {
-                fprintf(stderr,
-                        "ds4: expert shard decode profile layer=%u pos=%u flush=%.3f ms read=%.3f ms dispatch=%.3f ms write=%.3f ms",
-                        il,
-                        pos,
-                        (shard_t_flush - shard_t0) * 1000.0,
-                        (shard_t_read - shard_t_flush) * 1000.0,
-                        (shard_t_dispatch - shard_t_read) * 1000.0,
-                        (shard_t_write - shard_t_dispatch) * 1000.0);
+            shard_job.pool = g_shard_pool;
+            shard_job.layer = (uint8_t)il;
+            shard_job.n_selected = DS4_N_EXPERT_USED;
+            shard_job.profile = shard_profile;
+            for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
+                shard_job.selected[i] = (int)sel_i32[i];
+                shard_job.weights[i] = ew[i];
             }
+            ds4_quantize_row_q8_K(norm_cpu, shard_job.xq, DS4_N_EMBD);
         }
+        shard_t_quant = shard_profile ? now_sec() : 0.0;
 
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (shard_profile) {
-            const double shard_t_resume = now_sec();
-            fprintf(stderr,
-                    " resume=%.3f ms total=%.3f ms\n",
-                    (shard_t_resume - shard_t_write) * 1000.0,
-                    (shard_t_resume - shard_t0) * 1000.0);
+        if (ok) {
+            ds4_decode_shard_worker_start(&shard_job);
+            shard_job_active = true;
+            shard_t_signal = shard_profile ? now_sec() : 0.0;
+            ok = ds4_gpu_begin_commands() != 0;
+            shard_t_resume = shard_profile ? now_sec() : 0.0;
         }
     } else if (ok) {
         ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
@@ -9775,7 +9870,9 @@ static bool metal_graph_encode_decode_layer(
                                                  g->router_selected, g->router_weights,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+    if (!shard_job_active) {
+        DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+    }
     if (ok && !g_shard_pool) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -9790,7 +9887,7 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("ffn_moe_down", g->routed_down,
                                       (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos);
     }
-    if (ok) {
+    if (ok && !shard_job_active) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
     const bool fuse_shared_gate_up =
@@ -9821,7 +9918,7 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
     const bool fuse_shared_down_hc =
-        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+        !g_shard_pool && !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
     if (ok && fuse_shared_down_hc) {
         ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
                                                          g->shared_out,
@@ -9843,6 +9940,69 @@ static bool metal_graph_encode_decode_layer(
                                           g->shared_mid, 1) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+    if (shard_job_active) {
+        bool shard_finish_ok = ok;
+        const double shard_t_shared_wait0 = shard_profile ? now_sec() : 0.0;
+        if (shard_finish_ok) {
+            shard_finish_ok = ds4_gpu_end_commands() != 0;
+        }
+        const double shard_t_shared_done = shard_profile ? now_sec() : 0.0;
+        const double shard_t_wait0 = shard_profile ? now_sec() : 0.0;
+        const int shard_rc = ds4_decode_shard_worker_wait(&shard_job);
+        const double shard_t_remote_done = shard_profile ? now_sec() : 0.0;
+
+        if (shard_rc != 0) {
+            fprintf(stderr, "ds4: expert shard decode dispatch failed layer=%u pos=%u\n",
+                    il, pos);
+            shard_finish_ok = false;
+        }
+
+        double shard_t_write = shard_t_remote_done;
+        if (shard_finish_ok) {
+            shard_finish_ok = ds4_gpu_tensor_write(g->routed_out, 0,
+                                                   shard_job.routed,
+                                                   sizeof(shard_job.routed)) != 0;
+            shard_t_write = shard_profile ? now_sec() : 0.0;
+        }
+
+        double shard_t_post_resume = shard_t_write;
+        if (shard_finish_ok) {
+            shard_finish_ok = ds4_gpu_begin_commands() != 0;
+            shard_t_post_resume = shard_profile ? now_sec() : 0.0;
+        }
+
+        if (shard_profile) {
+            const double remote_ms =
+                (shard_job.dispatch_done - shard_job.dispatch_start) * 1000.0;
+            const double wait_remote_ms =
+                (shard_t_remote_done - shard_t_wait0) * 1000.0;
+            double overlap_ms = remote_ms - wait_remote_ms;
+            if (overlap_ms < 0.0) overlap_ms = 0.0;
+            fprintf(stderr,
+                    "ds4: expert shard decode overlap layer=%u pos=%u flush=%.3f ms read=%.3f ms quant=%.3f ms signal=%.3f ms resume=%.3f ms shared=%.3f ms shared_wait=%.3f ms remote=%.3f ms wait_remote=%.3f ms overlap=%.3f ms write=%.3f ms post_resume=%.3f ms total=%.3f ms status=%d\n",
+                    il,
+                    pos,
+                    (shard_t_flush - shard_t0) * 1000.0,
+                    (shard_t_read - shard_t_flush) * 1000.0,
+                    (shard_t_quant - shard_t_read) * 1000.0,
+                    (shard_t_signal - shard_t_quant) * 1000.0,
+                    (shard_t_resume - shard_t_signal) * 1000.0,
+                    (shard_t_shared_done - shard_t_resume) * 1000.0,
+                    (shard_t_shared_done - shard_t_shared_wait0) * 1000.0,
+                    remote_ms,
+                    wait_remote_ms,
+                    overlap_ms,
+                    (shard_t_write - shard_t_remote_done) * 1000.0,
+                    (shard_t_post_resume - shard_t_write) * 1000.0,
+                    (shard_t_post_resume - shard_t0) * 1000.0,
+                    shard_rc);
+        }
+
+        ok = ok && shard_finish_ok;
+    }
+    if (ok && shard_job_active) {
+        metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
     }
@@ -17042,6 +17202,7 @@ void ds4_engine_summary(ds4_engine *e) {
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
     if (e->shard_pool) {
+        ds4_decode_shard_worker_shutdown();
         g_shard_pool = NULL;
         ds4_shard_pool_close(e->shard_pool);
     }
