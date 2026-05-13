@@ -46,7 +46,7 @@
 #include <immintrin.h>
 #endif
 
-#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(DS4_USE_AVX512)
 static inline void ds4_avx512_dual_dot_i8x16(__m128i x0, __m128i x1, __m128i q8,
                                              int32_t *sum0, int32_t *sum1) {
     const __m256i both = _mm256_inserti128_si256(_mm256_castsi128_si256(x0), x1, 1);
@@ -1825,7 +1825,7 @@ static void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
     if (k % QK_K != 0) ds4_die("Q8_K quantization length is not QK_K aligned");
     const int64_t nb = k / QK_K;
 
-#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(DS4_USE_AVX512)
     const __m512 vabs_mask = _mm512_set1_ps(-0.0f);
     const __m512i ones16 = _mm512_set1_epi16(1);
     const __m512i ones8 = _mm512_set1_epi8(1);
@@ -2164,7 +2164,7 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
     }
 
     *s = sum;
-#elif defined(__AVX512F__) && defined(__AVX512BW__)
+#elif defined(__AVX512F__) && defined(__AVX512BW__) && defined(DS4_USE_AVX512)
     const __m256i m3 = _mm256_set1_epi8(3);
     const __m512i ones16 = _mm512_set1_epi16(1);
     float sumf = 0.0f;
@@ -2636,7 +2636,7 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
 
     *s0 = 0.25f * total0;
     *s1 = 0.25f * total1;
-#elif defined(__AVX512F__) && defined(__AVX512BW__)
+#elif defined(__AVX512F__) && defined(__AVX512BW__) && defined(DS4_USE_AVX512)
     const int nb = n / QK_K;
     float total0 = 0.0f;
     float total1 = 0.0f;
