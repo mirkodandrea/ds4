@@ -571,7 +571,7 @@ static void *ds4_decode_shard_worker_main(void *arg) {
     }
 }
 
-static void ds4_decode_shard_worker_start(ds4_decode_shard_job *job) {
+static DS4_MAYBE_UNUSED void ds4_decode_shard_worker_start(ds4_decode_shard_job *job) {
     pthread_mutex_lock(&g_decode_shard_mutex);
     if (!g_decode_shard_thread_started) {
         g_decode_shard_shutdown = false;
@@ -594,7 +594,7 @@ static void ds4_decode_shard_worker_start(ds4_decode_shard_job *job) {
     pthread_mutex_unlock(&g_decode_shard_mutex);
 }
 
-static int ds4_decode_shard_worker_wait(ds4_decode_shard_job *job) {
+static DS4_MAYBE_UNUSED int ds4_decode_shard_worker_wait(ds4_decode_shard_job *job) {
     pthread_mutex_lock(&g_decode_shard_mutex);
     while (!job->done) {
         pthread_cond_wait(&g_decode_shard_cond, &g_decode_shard_mutex);
