@@ -53,7 +53,7 @@ static int full_send(int fd, const void *buf, size_t len) {
     while (len > 0) {
         ssize_t n = send(fd, p, len, 0);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR && !g_stop) continue;
             return -1;
         }
         p += n;
@@ -67,7 +67,7 @@ static int full_recv(int fd, void *buf, size_t len) {
     while (len > 0) {
         ssize_t n = recv(fd, p, len, 0);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR && !g_stop) continue;
             return -1;
         }
         p += n;
@@ -80,7 +80,7 @@ static int full_writev(int fd, struct iovec *iov, int iovcnt) {
     while (iovcnt > 0) {
         ssize_t n = writev(fd, iov, iovcnt);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR && !g_stop) continue;
             return -1;
         }
         while (n > 0 && iovcnt > 0) {
@@ -462,8 +462,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    signal(SIGINT, stop_handler);
-    signal(SIGTERM, stop_handler);
+    /* Use sigaction without SA_RESTART so that blocking recv/send/accept
+     * return EINTR when the signal fires — allows clean shutdown. */
+    struct sigaction sa = { .sa_handler = stop_handler };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* no SA_RESTART */
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
     fprintf(stderr, "ds4-expert-server: listening on port %u\n", port);
