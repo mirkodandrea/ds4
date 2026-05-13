@@ -5446,6 +5446,27 @@ static inline float dot_f32(const float *a, const float *b, uint32_t n) {
     float acc = vaddvq_f32(vaddq_f32(acc0, acc1));
     for (; i < n; i++) acc += a[i] * b[i];
     return acc;
+#elif defined(__AVX2__)
+    uint32_t i = 0;
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),     _mm256_loadu_ps(b + i),     acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), acc1);
+    }
+    for (; i + 8 <= n; i += 8) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    /* Horizontal sum: 8 → 4 → 2 → 1 */
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    float acc = _mm_cvtss_f32(s);
+    for (; i < n; i++) acc += a[i] * b[i];
+    return acc;
 #else
     float acc = 0.0f;
     for (uint32_t i = 0; i < n; i++) acc += a[i] * b[i];
@@ -5462,6 +5483,17 @@ static inline void axpy_f32(float *y, const float *x, float a, uint32_t n) {
         vst1q_f32(y + i + 4, vfmaq_f32(vld1q_f32(y + i + 4), av, vld1q_f32(x + i + 4)));
     }
     for (; i < n; i++) y[i] += a * x[i];
+#elif defined(__AVX2__)
+    uint32_t i = 0;
+    const __m256 av = _mm256_set1_ps(a);
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_ps(y + i,     _mm256_fmadd_ps(av, _mm256_loadu_ps(x + i),     _mm256_loadu_ps(y + i)));
+        _mm256_storeu_ps(y + i + 8, _mm256_fmadd_ps(av, _mm256_loadu_ps(x + i + 8), _mm256_loadu_ps(y + i + 8)));
+    }
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(y + i, _mm256_fmadd_ps(av, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
+    }
+    for (; i < n; i++) y[i] += a * x[i];
 #else
     for (uint32_t i = 0; i < n; i++) y[i] += a * x[i];
 #endif
@@ -5474,6 +5506,17 @@ static inline void scale_f32(float *x, float a, uint32_t n) {
     for (; i + 8 <= n; i += 8) {
         vst1q_f32(x + i,     vmulq_f32(vld1q_f32(x + i),     av));
         vst1q_f32(x + i + 4, vmulq_f32(vld1q_f32(x + i + 4), av));
+    }
+    for (; i < n; i++) x[i] *= a;
+#elif defined(__AVX2__)
+    uint32_t i = 0;
+    const __m256 av = _mm256_set1_ps(a);
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_ps(x + i,     _mm256_mul_ps(_mm256_loadu_ps(x + i),     av));
+        _mm256_storeu_ps(x + i + 8, _mm256_mul_ps(_mm256_loadu_ps(x + i + 8), av));
+    }
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), av));
     }
     for (; i < n; i++) x[i] *= a;
 #else
@@ -5619,9 +5662,123 @@ static float softplus_stable(float x) {
 }
 
 static void swiglu(float *out, const float *gate, const float *up, uint64_t n) {
+#if defined(__AVX2__)
+    /* Vectorised SwiGLU: out[i] = gate[i] * sigmoid(gate[i]) * up[i]
+     *
+     * We compute sigmoid(x) = 1/(1+exp(-x)) using a fast, FMA-based exp(-x)
+     * approximation accurate to ~23 bits across the full float32 range.
+     *
+     * The exp approximation uses the identity:
+     *   exp(x) = 2^(x / ln2) = 2^(k + f)   where k = round(x/ln2), f = frac
+     * Then  exp(x) = 2^k * 2^f,  with 2^f ≈ polynomial(f).
+     * We use a 4th-order minimax polynomial for 2^f on [-0.5, 0.5]. */
+    const __m256 ln2     = _mm256_set1_ps(0.6931471805599453f);
+    const __m256 inv_ln2 = _mm256_set1_ps(1.4426950408889634f);
+    const __m256 half    = _mm256_set1_ps(0.5f);
+    const __m256 one     = _mm256_set1_ps(1.0f);
+    /* Minimax coefficients for 2^f on [-0.5, 0.5] */
+    const __m256 c0 = _mm256_set1_ps(1.0f);
+    const __m256 c1 = _mm256_set1_ps(0.6931471805599453f);   /* ln2 */
+    const __m256 c2 = _mm256_set1_ps(0.2402265069591007f);   /* (ln2)^2/2! */
+    const __m256 c3 = _mm256_set1_ps(0.05550410866482158f);  /* (ln2)^3/3! */
+    const __m256 c4 = _mm256_set1_ps(0.009618129107628477f); /* (ln2)^4/4! */
+    /* Clamp range to prevent overflow in 2^k (float range ≈ ±88) */
+    const __m256 exp_lo = _mm256_set1_ps(-87.3f);
+    const __m256 exp_hi = _mm256_set1_ps(88.3f);
+
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 x = _mm256_loadu_ps(gate + i);
+        __m256 u = _mm256_loadu_ps(up + i);
+
+        /* neg_x = -x, clamped for exp range */
+        __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+        neg_x = _mm256_max_ps(neg_x, exp_lo);
+        neg_x = _mm256_min_ps(neg_x, exp_hi);
+
+        /* k = round(neg_x / ln2),  f = neg_x - k * ln2 */
+        __m256 t = _mm256_fmadd_ps(neg_x, inv_ln2, half);
+        __m256 k = _mm256_floor_ps(t);
+        __m256 f = _mm256_fnmadd_ps(k, ln2, neg_x);  /* neg_x - k*ln2 */
+
+        /* 2^f ≈ c0 + c1*f + c2*f² + c3*f³ + c4*f⁴  (Horner) */
+        __m256 p = _mm256_fmadd_ps(c4, f, c3);
+        p = _mm256_fmadd_ps(p, f, c2);
+        p = _mm256_fmadd_ps(p, f, c1);
+        p = _mm256_fmadd_ps(p, f, c0);
+
+        /* 2^k: convert k to int, shift into exponent bits */
+        __m256i ki = _mm256_cvtps_epi32(k);
+        ki = _mm256_add_epi32(ki, _mm256_set1_epi32(127));
+        ki = _mm256_slli_epi32(ki, 23);
+        __m256 pow2k = _mm256_castsi256_ps(ki);
+
+        /* exp(-x) = 2^k * 2^f */
+        __m256 exp_neg_x = _mm256_mul_ps(pow2k, p);
+
+        /* sigmoid(x) = 1 / (1 + exp(-x)) */
+        __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, exp_neg_x));
+
+        /* out = x * sigmoid(x) * up = silu(x) * up */
+        __m256 result = _mm256_mul_ps(_mm256_mul_ps(x, sig), u);
+        _mm256_storeu_ps(out + i, result);
+    }
+    /* Scalar tail */
+    for (; i < n; i++) {
+        out[i] = silu(gate[i]) * up[i];
+    }
+#elif defined(__ARM_NEON)
+    /* Vectorised SwiGLU for NEON using the same fast exp(-x) approach. */
+    const float32x4_t ln2     = vdupq_n_f32(0.6931471805599453f);
+    const float32x4_t inv_ln2 = vdupq_n_f32(1.4426950408889634f);
+    const float32x4_t half    = vdupq_n_f32(0.5f);
+    const float32x4_t one     = vdupq_n_f32(1.0f);
+    const float32x4_t c0 = vdupq_n_f32(1.0f);
+    const float32x4_t c1 = vdupq_n_f32(0.6931471805599453f);
+    const float32x4_t c2 = vdupq_n_f32(0.2402265069591007f);
+    const float32x4_t c3 = vdupq_n_f32(0.05550410866482158f);
+    const float32x4_t c4 = vdupq_n_f32(0.009618129107628477f);
+    const float32x4_t exp_lo = vdupq_n_f32(-87.3f);
+    const float32x4_t exp_hi = vdupq_n_f32(88.3f);
+
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        for (int half_idx = 0; half_idx < 2; half_idx++) {
+            float32x4_t x = vld1q_f32(gate + i + half_idx * 4);
+            float32x4_t u = vld1q_f32(up + i + half_idx * 4);
+
+            float32x4_t neg_x = vnegq_f32(x);
+            neg_x = vmaxq_f32(neg_x, exp_lo);
+            neg_x = vminq_f32(neg_x, exp_hi);
+
+            float32x4_t t = vfmaq_f32(half, neg_x, inv_ln2);
+            float32x4_t k = vrndmq_f32(t);  /* floor */
+            float32x4_t f = vfmsq_f32(neg_x, k, ln2);  /* neg_x - k*ln2 */
+
+            float32x4_t p = vfmaq_f32(c3, c4, f);
+            p = vfmaq_f32(c2, p, f);
+            p = vfmaq_f32(c1, p, f);
+            p = vfmaq_f32(c0, p, f);
+
+            int32x4_t ki = vcvtq_s32_f32(k);
+            ki = vaddq_s32(ki, vdupq_n_s32(127));
+            ki = vshlq_n_s32(ki, 23);
+            float32x4_t pow2k = vreinterpretq_f32_s32(ki);
+
+            float32x4_t exp_neg_x = vmulq_f32(pow2k, p);
+            float32x4_t sig = vdivq_f32(one, vaddq_f32(one, exp_neg_x));
+            float32x4_t result = vmulq_f32(vmulq_f32(x, sig), u);
+            vst1q_f32(out + i + half_idx * 4, result);
+        }
+    }
+    for (; i < n; i++) {
+        out[i] = silu(gate[i]) * up[i];
+    }
+#else
     for (uint64_t i = 0; i < n; i++) {
         out[i] = silu(gate[i]) * up[i];
     }
+#endif
 }
 
 /* The shared expert is a normal Q8_0 SwiGLU MLP that runs for every token. */
