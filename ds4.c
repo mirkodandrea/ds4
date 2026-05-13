@@ -16893,6 +16893,91 @@ int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
     return 0;
 }
 
+/* Batched expert compute: single allocation, processes all tokens at once. */
+int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
+                                     const void *xq_all_bytes,
+                                     const uint16_t *expert_ids,
+                                     const float *expert_weights,
+                                     const uint8_t *token_n,
+                                     int n_tokens, int n_selected,
+                                     float *out_all) {
+    if (!e || layer >= DS4_N_LAYER || n_tokens <= 0 ||
+        n_selected <= 0 || n_selected > DS4_N_EXPERT_USED)
+        return -1;
+
+    const ds4_model *model = &e->model;
+    const ds4_layer_weights *lw = &e->weights.layer[layer];
+    const size_t q8k_blocks = DS4_N_EMBD / QK_K;
+    const size_t mid_blocks = DS4_N_FF_EXP / QK_K;
+
+    /* Count total active expert slots across all tokens for sizing. */
+    int total_experts = 0;
+    for (int t = 0; t < n_tokens; t++) {
+        total_experts += token_n[t];
+    }
+
+    if (total_experts == 0) {
+        memset(out_all, 0,
+               (size_t)n_tokens * (size_t)DS4_N_EMBD * sizeof(float));
+        return 0;
+    }
+
+    /* Single allocation for all intermediate buffers. */
+    float *mid_all = xmalloc((size_t)total_experts * DS4_N_FF_EXP * sizeof(float));
+    block_q8_K *midq = xmalloc((size_t)total_experts * mid_blocks * sizeof(block_q8_K));
+
+    int expert_offset = 0;
+    for (int t = 0; t < n_tokens; t++) {
+        float *out_row = out_all + (size_t)t * DS4_N_EMBD;
+        const uint8_t n_exp = token_n[t];
+
+        if (n_exp == 0) {
+            memset(out_row, 0, DS4_N_EMBD * sizeof(float));
+            continue;
+        }
+
+        const block_q8_K *xq = (const block_q8_K *)xq_all_bytes
+                                + (size_t)t * q8k_blocks;
+        const uint16_t *id_row = expert_ids + (size_t)t * (size_t)n_selected;
+        const float *w_row = expert_weights + (size_t)t * (size_t)n_selected;
+
+        int selected[DS4_N_EXPERT_USED];
+        float weights[DS4_N_EXPERT_USED];
+        for (int i = 0; i < n_exp; i++) {
+            selected[i] = (int)id_row[i];
+            weights[i] = w_row[i];
+        }
+
+        float *mid_ptr = mid_all + (size_t)expert_offset * DS4_N_FF_EXP;
+        block_q8_K *midq_ptr = midq + (size_t)expert_offset * mid_blocks;
+
+        memset(out_row, 0, DS4_N_EMBD * sizeof(float));
+
+        matvec_iq2_xxs_experts_mid_prequant(mid_ptr, model,
+                                            lw->ffn_gate_exps,
+                                            lw->ffn_up_exps,
+                                            xq, selected, weights,
+                                            n_exp,
+                                            DS4_SWIGLU_CLAMP_EXP);
+
+        for (int i = 0; i < n_exp; i++) {
+            ds4_quantize_row_q8_K(mid_ptr + (uint64_t)i * DS4_N_FF_EXP,
+                                  midq_ptr + (uint64_t)i * mid_blocks,
+                                  (int64_t)DS4_N_FF_EXP);
+        }
+
+        matvec_q2_k_experts_accum_prequant(out_row, model,
+                                           lw->ffn_down_exps,
+                                           midq_ptr, selected, n_exp);
+
+        expert_offset += n_exp;
+    }
+
+    free(midq);
+    free(mid_all);
+    return 0;
+}
+
 /* Check whether a tensor name refers to a routed expert weight. */
 static bool is_routed_expert_tensor(const ds4_tensor *t) {
     const char *name = t->name.ptr;

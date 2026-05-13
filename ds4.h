@@ -182,6 +182,17 @@ int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
                                const uint16_t *expert_ids,
                                const float *expert_weights,
                                int n_experts, float *out);
+
+/* Batched variant: compute experts for n_tokens in one call with a single
+ * scratch allocation.  Each token has token_n[t] active experts out of
+ * n_selected slots.  Tokens with token_n[t]==0 produce a zero output row. */
+int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
+                                     const void *xq_all,
+                                     const uint16_t *expert_ids,
+                                     const float *expert_weights,
+                                     const uint8_t *token_n,
+                                     int n_tokens, int n_selected,
+                                     float *out_all);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 

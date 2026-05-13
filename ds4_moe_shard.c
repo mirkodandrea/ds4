@@ -290,11 +290,24 @@ typedef struct {
 
     /* Per-dispatch work (set by main thread before signal). */
     uint8_t   layer;
+    bool      is_batch;        /* false = single-token, true = batch */
+
+    /* Single-token fields. */
     const void *xq;
     uint16_t  expert_ids[DS4_SHARD_N_EXPERT_USED];
     float     expert_weights[DS4_SHARD_N_EXPERT_USED];
     int       n_experts;
     float     out[DS4_SHARD_N_EMBD];
+
+    /* Batch fields (pointers owned by caller, valid only while has_work). */
+    const void *batch_xq;          /* n_tokens × Q8K_BYTES */
+    uint16_t   *batch_ids;         /* n_tokens × n_selected */
+    float      *batch_wts;         /* n_tokens × n_selected */
+    uint8_t    *batch_token_n;     /* n_tokens */
+    int         batch_n_tokens;
+    int         batch_n_selected;
+    float      *batch_out;         /* n_tokens × N_EMBD (caller-allocated) */
+
     int       result;
 
     /* Synchronization. */
@@ -330,7 +343,14 @@ static void *shard_worker_main(void *arg) {
         w->has_work = false;
         pthread_mutex_unlock(&w->mutex);
 
-        if (w->n_experts > 0) {
+        if (w->is_batch) {
+            /* Batch dispatch to remote shard. */
+            w->result = ds4_shard_dispatch_layer_batch(
+                w->shard, w->layer,
+                w->batch_xq, w->batch_ids, w->batch_wts,
+                w->batch_token_n, w->batch_n_tokens,
+                w->batch_n_selected, w->batch_out);
+        } else if (w->n_experts > 0) {
             w->result = ds4_shard_dispatch_layer(
                 w->shard, w->layer, w->xq,
                 w->expert_ids, w->expert_weights, w->n_experts,
@@ -440,6 +460,7 @@ int ds4_shard_pool_dispatch_layer(
     for (int si = 0; si < p->n_shards; si++) {
         shard_worker *w = &p->workers[si];
         w->layer = layer;
+        w->is_batch = false;
         w->xq = xq;
         w->n_experts = 0;
 
@@ -512,20 +533,31 @@ int ds4_shard_pool_dispatch_layer_batch(
     const double t0 = profile ? shard_now_sec() : 0.0;
     memset(out, 0, (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(float));
 
-    uint8_t *token_n = malloc((size_t)n_tokens * sizeof(*token_n));
-    uint16_t *ids = malloc((size_t)n_tokens * (size_t)n_selected * sizeof(*ids));
-    float *wts = malloc((size_t)n_tokens * (size_t)n_selected * sizeof(*wts));
-    float *partial = malloc((size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(*partial));
-    if (!token_n || !ids || !wts || !partial) {
-        free(token_n);
-        free(ids);
-        free(wts);
-        free(partial);
-        return -1;
-    }
+    const size_t tok_row = (size_t)n_tokens * (size_t)n_selected;
+    const size_t out_floats = (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD;
+
+    /* Per-shard scratch: token_n + ids + wts + partial output. */
+    const size_t per_shard_bytes =
+        (size_t)n_tokens * sizeof(uint8_t) +
+        tok_row * sizeof(uint16_t) +
+        tok_row * sizeof(float) +
+        out_floats * sizeof(float);
+
+    uint8_t *scratch = malloc((size_t)p->n_shards * per_shard_bytes);
+    if (!scratch) return -1;
+
+    /* ---- Prepare: filter experts per shard, set up worker fields ---- */
+    int n_active = 0;    /* how many shards actually have work */
+    int active_si[32];   /* shard indices with work (max 32 shards) */
 
     for (int si = 0; si < p->n_shards; si++) {
         shard_worker *w = &p->workers[si];
+        uint8_t *base = scratch + (size_t)si * per_shard_bytes;
+        uint8_t  *token_n = base;
+        uint16_t *ids = (uint16_t *)(base + (size_t)n_tokens * sizeof(uint8_t));
+        float    *wts = (float *)((uint8_t *)ids + tok_row * sizeof(uint16_t));
+        float    *partial = (float *)((uint8_t *)wts + tok_row * sizeof(float));
+
         int any = 0;
         for (int t = 0; t < n_tokens; t++) {
             int k = 0;
@@ -549,41 +581,64 @@ int ds4_shard_pool_dispatch_layer_batch(
         }
 
         if (!any) continue;
-        if (ds4_shard_dispatch_layer_batch(w->shard,
-                                           layer,
-                                           xq,
-                                           ids,
-                                           wts,
-                                           token_n,
-                                           n_tokens,
-                                           n_selected,
-                                           partial) != 0) {
-            free(token_n);
-            free(ids);
-            free(wts);
-            free(partial);
-            return -1;
-        }
-        const size_t count = (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD;
-        for (size_t i = 0; i < count; i++) out[i] += partial[i];
+
+        /* Set up batch work for this shard's worker thread. */
+        w->layer = layer;
+        w->is_batch = true;
+        w->batch_xq = xq;
+        w->batch_ids = ids;
+        w->batch_wts = wts;
+        w->batch_token_n = token_n;
+        w->batch_n_tokens = n_tokens;
+        w->batch_n_selected = n_selected;
+        w->batch_out = partial;
+        active_si[n_active++] = si;
     }
 
-    free(token_n);
-    free(ids);
-    free(wts);
-    free(partial);
+    /* ---- Fire: signal all active shard workers in parallel ---- */
+    for (int i = 0; i < n_active; i++) {
+        shard_worker *w = &p->workers[active_si[i]];
+        pthread_mutex_lock(&w->mutex);
+        w->done = false;
+        w->has_work = true;
+        pthread_cond_signal(&w->cond);
+        pthread_mutex_unlock(&w->mutex);
+    }
+
+    /* ---- Join: wait for all workers, accumulate partials ---- */
+    int rc = 0;
+    for (int i = 0; i < n_active; i++) {
+        shard_worker *w = &p->workers[active_si[i]];
+        pthread_mutex_lock(&w->mutex);
+        while (!w->done)
+            pthread_cond_wait(&w->cond, &w->mutex);
+        pthread_mutex_unlock(&w->mutex);
+
+        if (w->result != 0) {
+            fprintf(stderr, "ds4_moe_shard: batch dispatch failed for shard %d layer %u\n",
+                    active_si[i], layer);
+            rc = -1;
+            break;
+        }
+
+        for (size_t j = 0; j < out_floats; j++)
+            out[j] += w->batch_out[j];
+    }
+
+    free(scratch);
 
     if (profile) {
         const double t_done = shard_now_sec();
         fprintf(stderr,
-                "ds4_moe_shard: pool batch profile layer=%u shards=%d tokens=%d selected=%d total=%.3f ms\n",
+                "ds4_moe_shard: pool batch profile layer=%u shards=%d(%d active) tokens=%d selected=%d total=%.3f ms\n",
                 layer,
                 p->n_shards,
+                n_active,
                 n_tokens,
                 n_selected,
                 (t_done - t0) * 1000.0);
     }
-    return 0;
+    return rc;
 }
 
 /* ---- config parser ----------------------------------------------------- */

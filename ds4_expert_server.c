@@ -199,24 +199,11 @@ static void handle_connection(int cfd, ds4_engine *engine,
                 }
                 const double t_recv = profile ? server_now_sec() : 0.0;
 
-                for (uint16_t t = 0; t < n_tokens && ok_batch; t++) {
-                    float *out_row = out_all + (size_t)t * (size_t)DS4_SHARD_N_EMBD;
-                    if (token_n[t] == 0) {
-                        memset(out_row, 0, (size_t)DS4_SHARD_N_EMBD * sizeof(float));
-                        continue;
-                    }
-                    const uint16_t *id_row = ids + (size_t)t * (size_t)n_selected;
-                    const float *w_row = wts + (size_t)t * (size_t)n_selected;
-                    if (ds4_engine_compute_experts(engine,
-                                                   layer,
-                                                   xq_all + (size_t)t * DS4_SHARD_Q8K_BYTES,
-                                                   id_row,
-                                                   w_row,
-                                                   token_n[t],
-                                                   out_row) != 0) {
-                        ok_batch = false;
-                        break;
-                    }
+                /* Batched expert compute — single call, single allocation. */
+                if (ok_batch) {
+                    ok_batch = (ds4_engine_compute_experts_batch(
+                        engine, layer, xq_all, ids, wts, token_n,
+                        (int)n_tokens, (int)n_selected, out_all) == 0);
                 }
                 const double t_compute = profile ? server_now_sec() : 0.0;
 
