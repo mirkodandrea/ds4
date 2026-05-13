@@ -75,6 +75,9 @@ struct ds4_shard {
     uint16_t port;
     uint16_t expert_start;
     uint16_t expert_end;
+    /* Persistent send buffer — grows only, reused across dispatches. */
+    uint8_t *sendbuf;
+    size_t   sendbuf_cap;
 };
 
 static int shard_tcp_connect(const char *host, uint16_t port) {
@@ -96,7 +99,10 @@ static int shard_tcp_connect(const char *host, uint16_t port) {
     freeaddrinfo(res);
 
     int flag = 1;
+    int bufsize = 4 * 1024 * 1024;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
     return fd;
 }
 
@@ -126,6 +132,7 @@ int ds4_shard_connect(ds4_shard **out, const ds4_shard_config *cfg) {
 void ds4_shard_close(ds4_shard *s) {
     if (!s) return;
     if (s->fd >= 0) close(s->fd);
+    free(s->sendbuf);
     free(s);
 }
 
@@ -189,28 +196,28 @@ int ds4_shard_dispatch_layer(
     if (send_rc != 0) return -1;
     const double t_sent = profile ? shard_now_sec() : 0.0;
 
-    /* Read response. */
-    uint8_t rsp_hdr[DS4_SHARD_RSP_HDR_SIZE];
-    if (full_recv(s->fd, rsp_hdr, sizeof(rsp_hdr)) != 0) return -1;
-    const double t_rsp_hdr = profile ? shard_now_sec() : 0.0;
+    /* Read response header + output in one coalesced recv. */
+    uint8_t rsp_buf[DS4_SHARD_RSP_HDR_SIZE + DS4_SHARD_N_EMBD * sizeof(float)];
+    if (full_recv(s->fd, rsp_buf, sizeof(rsp_buf)) != 0) return -1;
+    const double t_recv = profile ? shard_now_sec() : 0.0;
 
     uint32_t rsp_magic;
-    memcpy(&rsp_magic, rsp_hdr, 4);
+    memcpy(&rsp_magic, rsp_buf, 4);
     if (rsp_magic != DS4_SHARD_MAGIC) return -1;
-    if (rsp_hdr[4] != DS4_SHARD_STATUS_OK) return -1;
+    if (rsp_buf[4] != DS4_SHARD_STATUS_OK) return -1;
 
-    if (full_recv(s->fd, out, (size_t)DS4_SHARD_N_EMBD * sizeof(float)) != 0) return -1;
+    memcpy(out, rsp_buf + DS4_SHARD_RSP_HDR_SIZE,
+           (size_t)DS4_SHARD_N_EMBD * sizeof(float));
     if (profile) {
         const double t_done = shard_now_sec();
         fprintf(stderr,
-                "ds4_moe_shard: profile host=%s:%u layer=%u experts=%d send=%.3f ms wait_hdr=%.3f ms recv_out=%.3f ms total=%.3f ms\n",
+                "ds4_moe_shard: profile host=%s:%u layer=%u experts=%d send=%.3f ms recv=%.3f ms total=%.3f ms\n",
                 s->host,
                 s->port,
                 layer,
                 n_experts,
                 (t_sent - t0) * 1000.0,
-                (t_rsp_hdr - t_sent) * 1000.0,
-                (t_done - t_rsp_hdr) * 1000.0,
+                (t_recv - t_sent) * 1000.0,
                 (t_done - t0) * 1000.0);
     }
     return 0;
@@ -254,8 +261,16 @@ static int ds4_shard_dispatch_layer_batch(
         (size_t)n_selected * sizeof(float) +            /* weights */
         DS4_SHARD_Q8K_BYTES;                            /* activation */
     const size_t total_send = sizeof(hdr) + (size_t)n_tokens * per_token;
-    uint8_t *sendbuf = malloc(total_send);
-    if (!sendbuf) return -1;
+    if (total_send > s->sendbuf_cap) {
+        free(s->sendbuf);
+        s->sendbuf = malloc(total_send);
+        if (!s->sendbuf) {
+            s->sendbuf_cap = 0;
+            return -1;
+        }
+        s->sendbuf_cap = total_send;
+    }
+    uint8_t *sendbuf = s->sendbuf;
 
     memcpy(sendbuf, hdr, sizeof(hdr));
     uint8_t *wp = sendbuf + sizeof(hdr);
@@ -275,7 +290,6 @@ static int ds4_shard_dispatch_layer_batch(
     }
 
     int send_rc = full_send(s->fd, sendbuf, total_send);
-    free(sendbuf);
     if (send_rc != 0) return -1;
     const double t_sent = profile ? shard_now_sec() : 0.0;
 
@@ -325,6 +339,7 @@ typedef struct {
     uint16_t  expert_ids[DS4_SHARD_N_EXPERT_USED];
     float     expert_weights[DS4_SHARD_N_EXPERT_USED];
     int       n_experts;
+    float    *out_ptr;
     float     out[DS4_SHARD_N_EMBD];
 
     /* Batch fields (pointers owned by caller, valid only while has_work). */
@@ -352,6 +367,9 @@ struct ds4_shard_pool {
     int           n_shards;
     pthread_mutex_t done_mutex;
     pthread_cond_t  done_cond;
+    /* Persistent scratch for batch dispatch — grows only. */
+    uint8_t *batch_scratch;
+    size_t   batch_scratch_cap;
 };
 
 static void *shard_worker_main(void *arg) {
@@ -382,10 +400,10 @@ static void *shard_worker_main(void *arg) {
             w->result = ds4_shard_dispatch_layer(
                 w->shard, w->layer, w->xq,
                 w->expert_ids, w->expert_weights, w->n_experts,
-                w->out);
+                w->out_ptr ? w->out_ptr : w->out);
         } else {
             w->result = 0;
-            memset(w->out, 0, sizeof(w->out));
+            memset(w->out_ptr ? w->out_ptr : w->out, 0, sizeof(w->out));
         }
 
         /* Signal completion. */
@@ -467,6 +485,7 @@ void ds4_shard_pool_close(ds4_shard_pool *p) {
     }
     pthread_mutex_destroy(&p->done_mutex);
     pthread_cond_destroy(&p->done_cond);
+    free(p->batch_scratch);
     free(p->workers);
     free(p);
 }
@@ -491,6 +510,7 @@ int ds4_shard_pool_dispatch_layer(
         w->is_batch = false;
         w->xq = xq;
         w->n_experts = 0;
+        w->out_ptr = (p->n_shards == 1) ? out : NULL;
 
         for (int ei = 0; ei < n_selected; ei++) {
             if (ds4_shard_owns(w->shard, selected[ei])) {
@@ -509,7 +529,7 @@ int ds4_shard_pool_dispatch_layer(
     }
 
     /* Wait for all workers and sum partial results. */
-    memset(out, 0, (size_t)DS4_SHARD_N_EMBD * sizeof(float));
+    if (p->n_shards != 1) memset(out, 0, (size_t)DS4_SHARD_N_EMBD * sizeof(float));
 
     for (int si = 0; si < p->n_shards; si++) {
         shard_worker *w = &p->workers[si];
@@ -524,7 +544,7 @@ int ds4_shard_pool_dispatch_layer(
             return -1;
         }
 
-        if (w->n_experts > 0) {
+        if (w->n_experts > 0 && p->n_shards != 1) {
             for (int d = 0; d < DS4_SHARD_N_EMBD; d++)
                 out[d] += w->out[d];
         }
@@ -570,9 +590,17 @@ int ds4_shard_pool_dispatch_layer_batch(
         tok_row * sizeof(uint16_t) +
         tok_row * sizeof(float) +
         out_floats * sizeof(float);
-
-    uint8_t *scratch = malloc((size_t)p->n_shards * per_shard_bytes);
-    if (!scratch) return -1;
+    const size_t scratch_bytes = (size_t)p->n_shards * per_shard_bytes;
+    if (scratch_bytes > p->batch_scratch_cap) {
+        free(p->batch_scratch);
+        p->batch_scratch = malloc(scratch_bytes);
+        if (!p->batch_scratch) {
+            p->batch_scratch_cap = 0;
+            return -1;
+        }
+        p->batch_scratch_cap = scratch_bytes;
+    }
+    uint8_t *scratch = p->batch_scratch;
 
     /* ---- Prepare: filter experts per shard, set up worker fields ---- */
     int n_active = 0;    /* how many shards actually have work */
@@ -619,7 +647,7 @@ int ds4_shard_pool_dispatch_layer_batch(
         w->batch_token_n = token_n;
         w->batch_n_tokens = n_tokens;
         w->batch_n_selected = n_selected;
-        w->batch_out = partial;
+        w->batch_out = (p->n_shards == 1) ? out : partial;
         active_si[n_active++] = si;
     }
 
@@ -649,11 +677,11 @@ int ds4_shard_pool_dispatch_layer_batch(
             break;
         }
 
-        for (size_t j = 0; j < out_floats; j++)
-            out[j] += w->batch_out[j];
+        if (p->n_shards != 1) {
+            for (size_t j = 0; j < out_floats; j++)
+                out[j] += w->batch_out[j];
+        }
     }
-
-    free(scratch);
 
     if (profile) {
         const double t_done = shard_now_sec();

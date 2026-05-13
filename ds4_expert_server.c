@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -75,6 +76,28 @@ static int full_recv(int fd, void *buf, size_t len) {
     return 0;
 }
 
+static int full_writev(int fd, struct iovec *iov, int iovcnt) {
+    while (iovcnt > 0) {
+        ssize_t n = writev(fd, iov, iovcnt);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        while (n > 0 && iovcnt > 0) {
+            if ((size_t)n >= iov[0].iov_len) {
+                n -= (ssize_t)iov[0].iov_len;
+                iov++;
+                iovcnt--;
+            } else {
+                iov[0].iov_base = (uint8_t *)iov[0].iov_base + n;
+                iov[0].iov_len -= (size_t)n;
+                n = 0;
+            }
+        }
+    }
+    return 0;
+}
+
 static void send_response(int fd, uint8_t status, uint8_t layer,
                           const float *out) {
     uint8_t hdr[DS4_SHARD_RSP_HDR_SIZE];
@@ -84,9 +107,15 @@ static void send_response(int fd, uint8_t status, uint8_t layer,
     hdr[5] = layer;
     hdr[6] = 0;
     hdr[7] = 0;
-    full_send(fd, hdr, sizeof(hdr));
     if (status == DS4_SHARD_STATUS_OK && out) {
-        full_send(fd, out, (size_t)DS4_SHARD_N_EMBD * sizeof(float));
+        struct iovec iov[2] = {
+            { .iov_base = hdr, .iov_len = sizeof(hdr) },
+            { .iov_base = (void *)out,
+              .iov_len = (size_t)DS4_SHARD_N_EMBD * sizeof(float) },
+        };
+        full_writev(fd, iov, 2);
+    } else {
+        full_send(fd, hdr, sizeof(hdr));
     }
 }
 
@@ -102,10 +131,15 @@ static void send_batch_response(int fd, uint8_t status, uint8_t layer,
     memcpy(hdr + 8, &n_tokens, sizeof(n_tokens));
     hdr[10] = 0;
     hdr[11] = 0;
-    full_send(fd, hdr, sizeof(hdr));
     if (status == DS4_SHARD_STATUS_OK && out && n_tokens > 0) {
-        full_send(fd, out,
-                  (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(float));
+        struct iovec iov[2] = {
+            { .iov_base = hdr, .iov_len = sizeof(hdr) },
+            { .iov_base = (void *)out,
+              .iov_len = (size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(float) },
+        };
+        full_writev(fd, iov, 2);
+    } else {
+        full_send(fd, hdr, sizeof(hdr));
     }
 }
 
@@ -444,7 +478,10 @@ int main(int argc, char **argv) {
         }
 
         int flag = 1;
+        int bufsize = 4 * 1024 * 1024;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+        setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
 
         fprintf(stderr, "ds4-expert-server: client connected\n");
         handle_connection(cfd, engine, expert_start, expert_end);
