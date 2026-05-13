@@ -17540,6 +17540,90 @@ int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
     return 0;
 }
 
+/* ---------- Mega-batch workers for all-tokens-at-once parallel_for ----------
+ *
+ * Instead of calling parallel_for once per token (90 barriers for batch=90),
+ * we flatten all tokens' work into a single index space and make ONE call.
+ * This eliminates 178 barrier synchronizations per layer (was 181, now 3). */
+
+/* Phase 1: Per-expert-slot descriptor for gate/up + SwiGLU. */
+typedef struct {
+    const uint8_t *gate_base;
+    const uint8_t *up_base;
+    const block_q8_K *xq;
+    float expert_weight;
+    uint64_t gate_row_bytes;
+    uint64_t up_row_bytes;
+} batch_mid_slot;
+
+typedef struct {
+    float *mid;              /* output: mid_all base pointer */
+    const batch_mid_slot *slots;
+    float clamp;
+    uint64_t in_dim;
+    uint64_t out_dim;        /* rows per expert (DS4_N_FF_EXP) */
+    int n_total_slots;
+} batch_mid_ctx;
+
+static void batch_mid_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    batch_mid_ctx *ctx = vctx;
+    const uint64_t od = ctx->out_dim;
+
+    for (uint64_t idx = row0; idx < row1; idx++) {
+        const uint64_t slot_idx = idx / od;
+        const uint64_t row = idx - slot_idx * od;
+        const batch_mid_slot *s = &ctx->slots[slot_idx];
+
+        float gate = 0.0f, up = 0.0f;
+        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(s->gate_base + row * s->gate_row_bytes);
+        const block_iq2_xxs *up_row   = (const block_iq2_xxs *)(s->up_base   + row * s->up_row_bytes);
+        ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, s->xq);
+
+        if (ctx->clamp > 1.0e-6f) {
+            if (gate >  ctx->clamp) gate =  ctx->clamp;
+            if (up   >  ctx->clamp) up   =  ctx->clamp;
+            if (up   < -ctx->clamp) up   = -ctx->clamp;
+        }
+        ctx->mid[idx] = silu(gate) * up * s->expert_weight;
+    }
+}
+
+/* Phase 3: Per-token descriptor for down projection accumulation. */
+typedef struct {
+    float *out;
+    const uint8_t *base[DS4_N_EXPERT_USED];
+    const block_q8_K *xq[DS4_N_EXPERT_USED];
+    uint64_t row_bytes[DS4_N_EXPERT_USED];
+    int n_expert;
+} batch_down_token;
+
+typedef struct {
+    const batch_down_token *tokens;
+    uint64_t in_dim;
+    uint64_t out_dim;        /* rows per token (DS4_N_EMBD) */
+    int n_active_tokens;
+} batch_down_ctx;
+
+static void batch_down_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    batch_down_ctx *ctx = vctx;
+    const uint64_t od = ctx->out_dim;
+
+    for (uint64_t idx = row0; idx < row1; idx++) {
+        const uint64_t tok = idx / od;
+        const uint64_t row = idx - tok * od;
+        const batch_down_token *t = &ctx->tokens[tok];
+
+        float acc = 0.0f;
+        for (int i = 0; i < t->n_expert; i++) {
+            float v = 0.0f;
+            const block_q2_K *br = (const block_q2_K *)(t->base[i] + row * t->row_bytes[i]);
+            ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &v, br, t->xq[i]);
+            acc += v;
+        }
+        t->out[row] = acc;
+    }
+}
+
 /* Worker for parallelized batch quantization: each "row" is one expert's
  * 2048-element intermediate vector that needs Q8_K quantization. */
 typedef struct {
@@ -17586,13 +17670,22 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
         return 0;
     }
 
-    /* Single allocation for all intermediate buffers. */
+    /* Single allocation for all intermediate + descriptor buffers. */
     float *mid_all = xmalloc((size_t)total_experts * DS4_N_FF_EXP * sizeof(float));
     block_q8_K *midq = xmalloc((size_t)total_experts * mid_blocks * sizeof(block_q8_K));
+    batch_mid_slot *mid_slots = xmalloc((size_t)total_experts * sizeof(batch_mid_slot));
 
-    /* Phase 1: Gate/up matmul + SwiGLU for all tokens.
-     * Each token's matvec_iq2_xxs_experts_mid_prequant() is internally
-     * parallelized across n_expert * out_dim rows. */
+    /* Resolve expert tensor pointers and dimensions once. */
+    const ds4_tensor *gate_w = lw->ffn_gate_exps;
+    const ds4_tensor *up_w   = lw->ffn_up_exps;
+    const ds4_tensor *down_w = lw->ffn_down_exps;
+    if (gate_w->type != 16 || up_w->type != 16) ds4_die("expected IQ2_XXS expert tensors");
+    if (down_w->type != 10) ds4_die("expected Q2_K expert tensor");
+
+    uint64_t gate_in_dim = 0, gate_out_dim = 0;
+    uint64_t down_in_dim = 0, down_out_dim = 0;
+
+    /* Phase 1 setup: build flat slot descriptors for all active expert slots. */
     int expert_offset = 0;
     for (int t = 0; t < n_tokens; t++) {
         const uint8_t n_exp = token_n[t];
@@ -17603,24 +17696,40 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
         const uint16_t *id_row = expert_ids + (size_t)t * (size_t)n_selected;
         const float *w_row = expert_weights + (size_t)t * (size_t)n_selected;
 
-        int selected[DS4_N_EXPERT_USED];
-        float weights[DS4_N_EXPERT_USED];
         for (int i = 0; i < n_exp; i++) {
-            selected[i] = (int)id_row[i];
-            weights[i] = w_row[i];
+            batch_mid_slot *s = &mid_slots[expert_offset + i];
+            uint64_t gin, gout, uin, uout;
+            s->gate_base = tensor_expert_bytes(model, gate_w, (uint32_t)id_row[i],
+                                               &gin, &gout, &s->gate_row_bytes);
+            s->up_base = tensor_expert_bytes(model, up_w, (uint32_t)id_row[i],
+                                             &uin, &uout, &s->up_row_bytes);
+            s->xq = xq;
+            s->expert_weight = w_row[i];
+            if (expert_offset + i == 0) {
+                gate_in_dim = gin;
+                gate_out_dim = gout;
+            }
         }
-
-        matvec_iq2_xxs_experts_mid_prequant(
-            mid_all + (size_t)expert_offset * DS4_N_FF_EXP,
-            model, lw->ffn_gate_exps, lw->ffn_up_exps,
-            xq, selected, weights, n_exp, DS4_SWIGLU_CLAMP_EXP);
         expert_offset += n_exp;
     }
 
-    /* Phase 2: Quantize ALL expert intermediates in one parallel call.
-     * Previously this was 6 serial quantizations * n_tokens iterations
-     * (e.g., 540 serial calls for batch=90).  Now it's one parallel_for
-     * over total_experts work items. */
+    /* Phase 1: Gate/up matmul + SwiGLU — ONE parallel_for over all expert slots.
+     * Index space: total_experts * gate_out_dim (e.g., 540 * 2048 = 1,105,920).
+     * Eliminates 89 barrier synchronizations vs per-token approach. */
+    batch_mid_ctx mctx = {
+        .mid = mid_all,
+        .slots = mid_slots,
+        .clamp = DS4_SWIGLU_CLAMP_EXP,
+        .in_dim = gate_in_dim,
+        .out_dim = gate_out_dim,
+        .n_total_slots = total_experts,
+    };
+    ds4_parallel_for((uint64_t)total_experts * gate_out_dim,
+                     batch_mid_worker, &mctx);
+
+    free(mid_slots);
+
+    /* Phase 2: Quantize ALL expert intermediates in one parallel call. */
     batch_quantize_q8k_ctx qctx = {
         .mid = mid_all,
         .midq = midq,
@@ -17628,33 +17737,59 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
     };
     ds4_parallel_for((uint64_t)total_experts, batch_quantize_q8k_worker, &qctx);
 
-    /* Phase 3: Down projection + accumulation for all tokens. */
-    expert_offset = 0;
+    /* Phase 3 setup: build per-token descriptors for down projection. */
+    int n_active_tokens = 0;
     for (int t = 0; t < n_tokens; t++) {
-        float *out_row = out_all + (size_t)t * DS4_N_EMBD;
-        const uint8_t n_exp = token_n[t];
+        if (token_n[t] > 0) n_active_tokens++;
+    }
 
+    batch_down_token *down_tokens = xmalloc((size_t)n_active_tokens * sizeof(batch_down_token));
+    expert_offset = 0;
+    int active_idx = 0;
+    for (int t = 0; t < n_tokens; t++) {
+        const uint8_t n_exp = token_n[t];
         if (n_exp == 0) {
-            memset(out_row, 0, DS4_N_EMBD * sizeof(float));
+            memset(out_all + (size_t)t * DS4_N_EMBD, 0, DS4_N_EMBD * sizeof(float));
             continue;
         }
 
+        batch_down_token *dt = &down_tokens[active_idx++];
+        dt->out = out_all + (size_t)t * DS4_N_EMBD;
+        dt->n_expert = n_exp;
         const uint16_t *id_row = expert_ids + (size_t)t * (size_t)n_selected;
-        int selected[DS4_N_EXPERT_USED];
-        for (int i = 0; i < n_exp; i++)
-            selected[i] = (int)id_row[i];
+        const uint64_t n_blocks = mid_blocks;
 
-        memset(out_row, 0, DS4_N_EMBD * sizeof(float));
-        matvec_q2_k_experts_accum_prequant(out_row, model, lw->ffn_down_exps,
-                                            midq + (size_t)expert_offset * mid_blocks,
-                                            selected, n_exp);
+        for (int i = 0; i < n_exp; i++) {
+            uint64_t din, dout;
+            dt->base[i] = tensor_expert_bytes(model, down_w, (uint32_t)id_row[i],
+                                              &din, &dout, &dt->row_bytes[i]);
+            dt->xq[i] = midq + (size_t)(expert_offset + i) * n_blocks;
+            if (expert_offset + i == 0) {
+                down_in_dim = din;
+                down_out_dim = dout;
+            }
+        }
         expert_offset += n_exp;
     }
 
+    /* Phase 3: Down projection — ONE parallel_for over all active tokens.
+     * Index space: n_active_tokens * down_out_dim (e.g., 90 * 4096 = 368,640).
+     * Eliminates another 89 barrier synchronizations. */
+    batch_down_ctx dctx = {
+        .tokens = down_tokens,
+        .in_dim = down_in_dim,
+        .out_dim = down_out_dim,
+        .n_active_tokens = n_active_tokens,
+    };
+    ds4_parallel_for((uint64_t)n_active_tokens * down_out_dim,
+                     batch_down_worker, &dctx);
+
+    free(down_tokens);
     free(midq);
     free(mid_all);
     return 0;
 }
+
 
 
 /* Check whether a tensor name refers to a routed expert weight. */
