@@ -17540,6 +17540,23 @@ int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
     return 0;
 }
 
+/* Worker for parallelized batch quantization: each "row" is one expert's
+ * 2048-element intermediate vector that needs Q8_K quantization. */
+typedef struct {
+    float *mid;
+    block_q8_K *midq;
+    size_t mid_blocks;
+} batch_quantize_q8k_ctx;
+
+static void batch_quantize_q8k_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    batch_quantize_q8k_ctx *ctx = vctx;
+    for (uint64_t i = row0; i < row1; i++) {
+        ds4_quantize_row_q8_K(ctx->mid + i * DS4_N_FF_EXP,
+                              ctx->midq + i * ctx->mid_blocks,
+                              (int64_t)DS4_N_FF_EXP);
+    }
+}
+
 /* Batched expert compute: single allocation, processes all tokens at once. */
 int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
                                      const void *xq_all_bytes,
@@ -17573,15 +17590,13 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
     float *mid_all = xmalloc((size_t)total_experts * DS4_N_FF_EXP * sizeof(float));
     block_q8_K *midq = xmalloc((size_t)total_experts * mid_blocks * sizeof(block_q8_K));
 
+    /* Phase 1: Gate/up matmul + SwiGLU for all tokens.
+     * Each token's matvec_iq2_xxs_experts_mid_prequant() is internally
+     * parallelized across n_expert * out_dim rows. */
     int expert_offset = 0;
     for (int t = 0; t < n_tokens; t++) {
-        float *out_row = out_all + (size_t)t * DS4_N_EMBD;
         const uint8_t n_exp = token_n[t];
-
-        if (n_exp == 0) {
-            memset(out_row, 0, DS4_N_EMBD * sizeof(float));
-            continue;
-        }
+        if (n_exp == 0) continue;
 
         const block_q8_K *xq = (const block_q8_K *)xq_all_bytes
                                 + (size_t)t * q8k_blocks;
@@ -17595,28 +17610,44 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
             weights[i] = w_row[i];
         }
 
-        float *mid_ptr = mid_all + (size_t)expert_offset * DS4_N_FF_EXP;
-        block_q8_K *midq_ptr = midq + (size_t)expert_offset * mid_blocks;
+        matvec_iq2_xxs_experts_mid_prequant(
+            mid_all + (size_t)expert_offset * DS4_N_FF_EXP,
+            model, lw->ffn_gate_exps, lw->ffn_up_exps,
+            xq, selected, weights, n_exp, DS4_SWIGLU_CLAMP_EXP);
+        expert_offset += n_exp;
+    }
 
-        memset(out_row, 0, DS4_N_EMBD * sizeof(float));
+    /* Phase 2: Quantize ALL expert intermediates in one parallel call.
+     * Previously this was 6 serial quantizations * n_tokens iterations
+     * (e.g., 540 serial calls for batch=90).  Now it's one parallel_for
+     * over total_experts work items. */
+    batch_quantize_q8k_ctx qctx = {
+        .mid = mid_all,
+        .midq = midq,
+        .mid_blocks = mid_blocks,
+    };
+    ds4_parallel_for((uint64_t)total_experts, batch_quantize_q8k_worker, &qctx);
 
-        matvec_iq2_xxs_experts_mid_prequant(mid_ptr, model,
-                                            lw->ffn_gate_exps,
-                                            lw->ffn_up_exps,
-                                            xq, selected, weights,
-                                            n_exp,
-                                            DS4_SWIGLU_CLAMP_EXP);
+    /* Phase 3: Down projection + accumulation for all tokens. */
+    expert_offset = 0;
+    for (int t = 0; t < n_tokens; t++) {
+        float *out_row = out_all + (size_t)t * DS4_N_EMBD;
+        const uint8_t n_exp = token_n[t];
 
-        for (int i = 0; i < n_exp; i++) {
-            ds4_quantize_row_q8_K(mid_ptr + (uint64_t)i * DS4_N_FF_EXP,
-                                  midq_ptr + (uint64_t)i * mid_blocks,
-                                  (int64_t)DS4_N_FF_EXP);
+        if (n_exp == 0) {
+            memset(out_row, 0, DS4_N_EMBD * sizeof(float));
+            continue;
         }
 
-        matvec_q2_k_experts_accum_prequant(out_row, model,
-                                           lw->ffn_down_exps,
-                                           midq_ptr, selected, n_exp);
+        const uint16_t *id_row = expert_ids + (size_t)t * (size_t)n_selected;
+        int selected[DS4_N_EXPERT_USED];
+        for (int i = 0; i < n_exp; i++)
+            selected[i] = (int)id_row[i];
 
+        memset(out_row, 0, DS4_N_EMBD * sizeof(float));
+        matvec_q2_k_experts_accum_prequant(out_row, model, lw->ffn_down_exps,
+                                            midq + (size_t)expert_offset * mid_blocks,
+                                            selected, n_exp);
         expert_offset += n_exp;
     }
 
@@ -17624,6 +17655,7 @@ int ds4_engine_compute_experts_batch(ds4_engine *e, uint8_t layer,
     free(mid_all);
     return 0;
 }
+
 
 /* Check whether a tensor name refers to a routed expert weight. */
 static bool is_routed_expert_tensor(const ds4_tensor *t) {
