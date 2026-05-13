@@ -68,6 +68,7 @@ typedef struct {
     bool warm_weights;
     bool quality;
     const char *expert_shards;  /* "host:port:start-end,..." or NULL */
+    bool expert_only;           /* expert-server mode: skip GPU, only access expert tensors */
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

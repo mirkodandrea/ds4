@@ -211,11 +211,13 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ds4-expert-server: loading %s (experts %u–%u)\n",
             model_path, expert_start, expert_end);
 
-    /* Load model with CPU backend — no GPU needed. */
+    /* Load model with CPU backend in expert-only mode — skip GPU, release
+     * non-expert pages, keep only expert weight tensors resident. */
     ds4_engine_options opts = {
         .model_path = model_path,
         .backend = DS4_BACKEND_CPU,
         .n_threads = n_threads,
+        .expert_only = true,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opts) != 0) {

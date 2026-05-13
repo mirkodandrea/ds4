@@ -16631,6 +16631,41 @@ int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
     return 0;
 }
 
+/* Check whether a tensor name refers to a routed expert weight. */
+static bool is_routed_expert_tensor(const ds4_tensor *t) {
+    const char *name = t->name.ptr;
+    uint64_t len = t->name.len;
+    /* Match any name ending with ffn_{gate,up,down}_exps.weight */
+    const char *suffixes[] = {
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    };
+    for (int i = 0; i < 3; i++) {
+        size_t slen = strlen(suffixes[i]);
+        if (len >= slen && memcmp(name + len - slen, suffixes[i], slen) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* madvise a set of tensors within a model mapping. */
+static void model_madvise_tensors(const ds4_model *m, bool expert, int advice) {
+#if defined(POSIX_MADV_DONTNEED)
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        if (is_routed_expert_tensor(t) != expert) continue;
+        uintptr_t base = (uintptr_t)m->map + t->abs_offset;
+        uintptr_t page = base & ~(uintptr_t)4095;
+        size_t len = (size_t)(t->bytes + (base - page));
+        (void)posix_madvise((void *)page, len, advice);
+    }
+#else
+    (void)m; (void)expert; (void)advice;
+#endif
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
@@ -16656,12 +16691,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
-    const bool graph_backend = ds4_backend_uses_graph(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, true);
-    if (opt->warm_weights) model_warm_weights(&e->model);
+    /* expert_only mode forces CPU — no GPU needed for expert serving. */
+    const bool graph_backend = !opt->expert_only && ds4_backend_uses_graph(opt->backend);
+    model_open(&e->model, opt->model_path, graph_backend,
+               /* prefetch_cpu: skip for expert_only — we'll selectively madvise later */
+               !opt->expert_only);
+    if (opt->warm_weights && !opt->expert_only) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
+
+    /* In expert_only mode, DONTNEED all non-expert pages so the expert server
+     * doesn't consume RAM for attention/embedding weights it never touches. */
+    if (opt->expert_only) {
+        model_madvise_tensors(&e->model, /*expert=*/false, POSIX_MADV_DONTNEED);
+        model_madvise_tensors(&e->model, /*expert=*/true,  POSIX_MADV_WILLNEED);
+        uint64_t expert_bytes = 0;
+        for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+            if (is_routed_expert_tensor(&e->model.tensors[i]))
+                expert_bytes += e->model.tensors[i].bytes;
+        }
+        fprintf(stderr, "ds4: expert-only mode — %.2f GiB expert weights, non-expert pages released\n",
+                (double)expert_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
@@ -16704,6 +16757,30 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
+
+        /* When expert shards are configured, DONTNEED expert tensor pages
+         * and disable Metal residency / warmup so the GPU doesn't try to
+         * make the ~72 GiB expert block GPU-resident on a small machine.
+         * Metal's newBufferWithBytesNoCopy wraps existing VM addresses
+         * without allocating — the non-expert ~8 GiB will page in on demand. */
+        if (opt->expert_shards && opt->expert_shards[0]) {
+            model_madvise_tensors(&e->model, /*expert=*/true, POSIX_MADV_DONTNEED);
+            setenv("DS4_METAL_NO_RESIDENCY", "1", 0);
+            setenv("DS4_METAL_NO_MODEL_WARMUP", "1", 0);
+
+            uint64_t expert_bytes = 0, other_bytes = 0;
+            for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+                if (is_routed_expert_tensor(&e->model.tensors[i]))
+                    expert_bytes += e->model.tensors[i].bytes;
+                else
+                    other_bytes += e->model.tensors[i].bytes;
+            }
+            fprintf(stderr, "ds4: expert shard mode — skipping Metal residency/warmup, "
+                    "expert pages DONTNEED'd (%.2f GiB expert, %.2f GiB non-expert)\n",
+                    (double)expert_bytes / (1024.0 * 1024.0 * 1024.0),
+                    (double)other_bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+
         if (!ds4_gpu_set_model_map_range(e->model.map,
                                            e->model.size,
                                            e->model.tensor_data_pos,
@@ -16773,24 +16850,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         free(cfgs);
         g_shard_pool = e->shard_pool;
 
-        /* Hint the OS not to page-in expert weight data on the coordinator.
-         * With mmap lazy loading, these pages stay on disk unless something
-         * reads them.  The remote dispatch path skips all local expert
-         * matmuls, so the hint is a safety net against accidental access. */
-        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            const ds4_layer_weights *lw = &e->weights.layer[il];
-            const ds4_tensor *exp_tensors[] = {
-                lw->ffn_gate_exps, lw->ffn_up_exps, lw->ffn_down_exps
-            };
-            for (int t = 0; t < 3; t++) {
-                const ds4_tensor *et = exp_tensors[t];
-                if (!et) continue;
-                uintptr_t base = (uintptr_t)e->model.map + et->abs_offset;
-                uintptr_t page = base & ~(uintptr_t)4095;
-                size_t len = (size_t)(et->bytes + (base - page));
-                (void)posix_madvise((void *)page, len, POSIX_MADV_DONTNEED);
-            }
-        }
+        /* Second-pass DONTNEED for expert pages (first pass happens before
+         * Metal view creation above; this catches the CPU-only backend path). */
+        model_madvise_tensors(&e->model, /*expert=*/true, POSIX_MADV_DONTNEED);
         fprintf(stderr, "ds4: expert shards connected, expert weight pages marked DONTNEED\n");
     }
 
