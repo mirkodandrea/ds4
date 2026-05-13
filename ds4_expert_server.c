@@ -42,7 +42,9 @@ static double server_now_sec(void) {
 }
 
 static int server_profile_enabled(void) {
-    return getenv("DS4_EXPERT_SHARD_PROFILE") != NULL;
+    static int cached = -1;
+    if (cached < 0) cached = (getenv("DS4_EXPERT_SHARD_PROFILE") != NULL);
+    return cached;
 }
 
 static int full_send(int fd, const void *buf, size_t len) {
@@ -115,8 +117,20 @@ static void handle_connection(int cfd, ds4_engine *engine,
     uint8_t xq_buf[DS4_SHARD_Q8K_BYTES];
     float out[DS4_SHARD_N_EMBD];
 
+    /* Pre-allocated batch buffers — grown as needed, reused across requests. */
+    size_t batch_cap = 0;         /* current capacity in tokens */
+    uint8_t *batch_token_n = NULL;
+    uint16_t *batch_ids = NULL;
+    float *batch_wts = NULL;
+    uint8_t *batch_xq = NULL;
+    float *batch_out = NULL;
+    uint8_t *batch_recv_buf = NULL;
+    size_t batch_recv_cap = 0;
+
+    /* Cache profile setting once per connection (avoid getenv on hot path). */
+    const int profile = server_profile_enabled();
+
     while (!g_stop) {
-        const int profile = server_profile_enabled();
         const double t0 = profile ? server_now_sec() : 0.0;
         if (full_recv(cfd, hdr, sizeof(hdr)) != 0) break;
 
@@ -159,58 +173,83 @@ static void handle_connection(int cfd, ds4_engine *engine,
                     continue;
                 }
 
-                const size_t token_rows = (size_t)n_tokens * (size_t)n_selected;
-                uint8_t *token_n = malloc((size_t)n_tokens * sizeof(*token_n));
-                uint16_t *ids = malloc(token_rows * sizeof(*ids));
-                float *wts = malloc(token_rows * sizeof(*wts));
-                uint8_t *xq_all = malloc((size_t)n_tokens * DS4_SHARD_Q8K_BYTES);
-                float *out_all = malloc((size_t)n_tokens * (size_t)DS4_SHARD_N_EMBD * sizeof(*out_all));
-                if (!token_n || !ids || !wts || !xq_all || !out_all) {
-                    free(token_n);
-                    free(ids);
-                    free(wts);
-                    free(xq_all);
-                    free(out_all);
-                    send_batch_response(cfd, DS4_SHARD_STATUS_ERR, layer, n_tokens, NULL);
-                    continue;
+                /* Grow pre-allocated buffers if needed. */
+                if ((size_t)n_tokens > batch_cap) {
+                    size_t new_cap = (size_t)n_tokens;
+                    size_t token_rows = new_cap * (size_t)DS4_SHARD_N_EXPERT_USED;
+                    free(batch_token_n); batch_token_n = malloc(new_cap * sizeof(*batch_token_n));
+                    free(batch_ids);     batch_ids     = malloc(token_rows * sizeof(*batch_ids));
+                    free(batch_wts);     batch_wts     = malloc(token_rows * sizeof(*batch_wts));
+                    free(batch_xq);      batch_xq      = malloc(new_cap * DS4_SHARD_Q8K_BYTES);
+                    free(batch_out);     batch_out     = malloc(new_cap * (size_t)DS4_SHARD_N_EMBD * sizeof(*batch_out));
+                    if (!batch_token_n || !batch_ids || !batch_wts || !batch_xq || !batch_out) {
+                        send_batch_response(cfd, DS4_SHARD_STATUS_ERR, layer, n_tokens, NULL);
+                        continue;
+                    }
+                    batch_cap = new_cap;
                 }
 
+                /* Coalesced recv: read all per-token data in one syscall. */
+                const size_t per_token =
+                    sizeof(uint32_t) +
+                    (size_t)n_selected * sizeof(uint16_t) +
+                    (size_t)n_selected * sizeof(float) +
+                    DS4_SHARD_Q8K_BYTES;
+                const size_t total_recv = (size_t)n_tokens * per_token;
+                if (total_recv > batch_recv_cap) {
+                    free(batch_recv_buf);
+                    batch_recv_buf = malloc(total_recv);
+                    if (!batch_recv_buf) {
+                        batch_recv_cap = 0;
+                        send_batch_response(cfd, DS4_SHARD_STATUS_ERR, layer, n_tokens, NULL);
+                        continue;
+                    }
+                    batch_recv_cap = total_recv;
+                }
+
+                if (full_recv(cfd, batch_recv_buf, total_recv) != 0) break;
+                const double t_recv = profile ? server_now_sec() : 0.0;
+
+                /* Unpack the coalesced buffer into structured arrays. */
                 bool ok_batch = true;
+                const uint8_t *rp = batch_recv_buf;
                 for (uint16_t t = 0; t < n_tokens && ok_batch; t++) {
                     uint32_t token_hdr = 0;
-                    if (full_recv(cfd, &token_hdr, sizeof(token_hdr)) != 0) { ok_batch = false; break; }
-                    token_n[t] = (uint8_t)(token_hdr & 0xFFu);
-                    if (token_n[t] > n_selected) { ok_batch = false; break; }
+                    memcpy(&token_hdr, rp, sizeof(token_hdr));
+                    rp += sizeof(token_hdr);
+                    batch_token_n[t] = (uint8_t)(token_hdr & 0xFFu);
+                    if (batch_token_n[t] > n_selected) { ok_batch = false; break; }
 
-                    uint16_t *id_row = ids + (size_t)t * (size_t)n_selected;
-                    float *w_row = wts + (size_t)t * (size_t)n_selected;
-                    if (full_recv(cfd, id_row, (size_t)n_selected * sizeof(uint16_t)) != 0) { ok_batch = false; break; }
-                    if (full_recv(cfd, w_row, (size_t)n_selected * sizeof(float)) != 0) { ok_batch = false; break; }
-                    if (full_recv(cfd,
-                                  xq_all + (size_t)t * DS4_SHARD_Q8K_BYTES,
-                                  DS4_SHARD_Q8K_BYTES) != 0) { ok_batch = false; break; }
+                    uint16_t *id_row = batch_ids + (size_t)t * (size_t)n_selected;
+                    float *w_row = batch_wts + (size_t)t * (size_t)n_selected;
+                    memcpy(id_row, rp, (size_t)n_selected * sizeof(uint16_t));
+                    rp += (size_t)n_selected * sizeof(uint16_t);
+                    memcpy(w_row, rp, (size_t)n_selected * sizeof(float));
+                    rp += (size_t)n_selected * sizeof(float);
+                    memcpy(batch_xq + (size_t)t * DS4_SHARD_Q8K_BYTES, rp,
+                           DS4_SHARD_Q8K_BYTES);
+                    rp += DS4_SHARD_Q8K_BYTES;
 
-                    for (uint8_t i = 0; i < token_n[t]; i++) {
+                    for (uint8_t i = 0; i < batch_token_n[t]; i++) {
                         if (id_row[i] < expert_start || id_row[i] >= expert_end) {
                             ok_batch = false;
                             break;
                         }
                     }
                 }
-                const double t_recv = profile ? server_now_sec() : 0.0;
 
-                /* Batched expert compute — single call, single allocation. */
+                /* Batched expert compute — single call. */
                 if (ok_batch) {
                     ok_batch = (ds4_engine_compute_experts_batch(
-                        engine, layer, xq_all, ids, wts, token_n,
-                        (int)n_tokens, (int)n_selected, out_all) == 0);
+                        engine, layer, batch_xq, batch_ids, batch_wts, batch_token_n,
+                        (int)n_tokens, (int)n_selected, batch_out) == 0);
                 }
                 const double t_compute = profile ? server_now_sec() : 0.0;
 
                 if (!ok_batch) {
                     send_batch_response(cfd, DS4_SHARD_STATUS_ERR, layer, n_tokens, NULL);
                 } else {
-                    send_batch_response(cfd, DS4_SHARD_STATUS_OK, layer, n_tokens, out_all);
+                    send_batch_response(cfd, DS4_SHARD_STATUS_OK, layer, n_tokens, batch_out);
                 }
                 if (profile) {
                     const double t_done = server_now_sec();
@@ -225,11 +264,6 @@ static void handle_connection(int cfd, ds4_engine *engine,
                             (t_done - t0) * 1000.0);
                 }
 
-                free(token_n);
-                free(ids);
-                free(wts);
-                free(xq_all);
-                free(out_all);
                 continue;
             }
             fprintf(stderr, "expert-server: unknown command 0x%02x\n", cmd);
@@ -248,18 +282,20 @@ static void handle_connection(int cfd, ds4_engine *engine,
             continue;
         }
 
-        if (full_recv(cfd, expert_ids, (size_t)n_experts * sizeof(uint16_t)) != 0) break;
-        if (full_recv(cfd, expert_weights, (size_t)n_experts * sizeof(float)) != 0) break;
-
-        size_t act_size = (flags & DS4_SHARD_FLAG_Q8K) ?
-                          DS4_SHARD_Q8K_BYTES :
-                          (size_t)DS4_SHARD_N_EMBD * sizeof(float);
-        if (act_size > sizeof(xq_buf)) {
-            /* f32 activation is larger; for now only support Q8_K. */
+        if (!(flags & DS4_SHARD_FLAG_Q8K)) {
             send_response(cfd, DS4_SHARD_STATUS_ERR, layer, NULL);
             continue;
         }
-        if (full_recv(cfd, xq_buf, act_size) != 0) break;
+
+        /* Coalesced recv: read ids + weights + activation in one call. */
+        const size_t ids_sz = (size_t)n_experts * sizeof(uint16_t);
+        const size_t wts_sz = (size_t)n_experts * sizeof(float);
+        const size_t body_sz = ids_sz + wts_sz + DS4_SHARD_Q8K_BYTES;
+        uint8_t recv_body[DS4_SHARD_N_EXPERT_USED * (sizeof(uint16_t) + sizeof(float)) + DS4_SHARD_Q8K_BYTES];
+        if (full_recv(cfd, recv_body, body_sz) != 0) break;
+        memcpy(expert_ids, recv_body, ids_sz);
+        memcpy(expert_weights, recv_body + ids_sz, wts_sz);
+        memcpy(xq_buf, recv_body + ids_sz + wts_sz, DS4_SHARD_Q8K_BYTES);
         const double t_recv = profile ? server_now_sec() : 0.0;
 
         /* Validate expert ownership. */
@@ -299,6 +335,14 @@ static void handle_connection(int cfd, ds4_engine *engine,
                     (t_done - t0) * 1000.0);
         }
     }
+
+    /* Free pre-allocated batch buffers. */
+    free(batch_token_n);
+    free(batch_ids);
+    free(batch_wts);
+    free(batch_xq);
+    free(batch_out);
+    free(batch_recv_buf);
 }
 
 static void usage(void) {

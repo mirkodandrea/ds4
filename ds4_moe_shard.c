@@ -34,7 +34,9 @@ static double shard_now_sec(void) {
 }
 
 static int shard_profile_enabled(void) {
-    return getenv("DS4_EXPERT_SHARD_PROFILE") != NULL;
+    static int cached = -1;
+    if (cached < 0) cached = (getenv("DS4_EXPERT_SHARD_PROFILE") != NULL);
+    return cached;
 }
 
 static int full_send(int fd, const void *buf, size_t len) {
@@ -162,7 +164,7 @@ int ds4_shard_dispatch_layer(
     const int profile = shard_profile_enabled();
     const double t0 = profile ? shard_now_sec() : 0.0;
 
-    /* Build request. */
+    /* Build and send request in one coalesced write. */
     uint8_t hdr[DS4_SHARD_REQ_HDR_SIZE];
     uint32_t magic = DS4_SHARD_MAGIC;
     memcpy(hdr, &magic, 4);
@@ -171,10 +173,20 @@ int ds4_shard_dispatch_layer(
     hdr[6] = (uint8_t)n_experts;
     hdr[7] = DS4_SHARD_FLAG_Q8K;
 
-    if (full_send(s->fd, hdr, sizeof(hdr)) != 0) return -1;
-    if (full_send(s->fd, expert_ids, (size_t)n_experts * sizeof(uint16_t)) != 0) return -1;
-    if (full_send(s->fd, expert_weights, (size_t)n_experts * sizeof(float)) != 0) return -1;
-    if (full_send(s->fd, xq, DS4_SHARD_Q8K_BYTES) != 0) return -1;
+    const size_t ids_sz = (size_t)n_experts * sizeof(uint16_t);
+    const size_t wts_sz = (size_t)n_experts * sizeof(float);
+    const size_t total = sizeof(hdr) + ids_sz + wts_sz + DS4_SHARD_Q8K_BYTES;
+    uint8_t sendbuf_stack[DS4_SHARD_REQ_HDR_SIZE + DS4_SHARD_N_EXPERT_USED * (sizeof(uint16_t) + sizeof(float)) + DS4_SHARD_Q8K_BYTES];
+    uint8_t *buf = (total <= sizeof(sendbuf_stack)) ? sendbuf_stack : malloc(total);
+    if (!buf) return -1;
+
+    memcpy(buf, hdr, sizeof(hdr));
+    memcpy(buf + sizeof(hdr), expert_ids, ids_sz);
+    memcpy(buf + sizeof(hdr) + ids_sz, expert_weights, wts_sz);
+    memcpy(buf + sizeof(hdr) + ids_sz + wts_sz, xq, DS4_SHARD_Q8K_BYTES);
+    int send_rc = full_send(s->fd, buf, total);
+    if (buf != sendbuf_stack) free(buf);
+    if (send_rc != 0) return -1;
     const double t_sent = profile ? shard_now_sec() : 0.0;
 
     /* Read response. */
@@ -234,21 +246,37 @@ static int ds4_shard_dispatch_layer_batch(
     memcpy(hdr + 8, &n_tok_u16, sizeof(n_tok_u16));
     memcpy(hdr + 10, &n_sel_u16, sizeof(n_sel_u16));
 
-    if (full_send(s->fd, hdr, sizeof(hdr)) != 0) return -1;
+    /* Coalesce header + all per-token data into one contiguous send to
+     * minimize syscall overhead (was 4 sends × n_tokens before). */
+    const size_t per_token =
+        sizeof(uint32_t) +                              /* token_hdr */
+        (size_t)n_selected * sizeof(uint16_t) +         /* ids */
+        (size_t)n_selected * sizeof(float) +            /* weights */
+        DS4_SHARD_Q8K_BYTES;                            /* activation */
+    const size_t total_send = sizeof(hdr) + (size_t)n_tokens * per_token;
+    uint8_t *sendbuf = malloc(total_send);
+    if (!sendbuf) return -1;
+
+    memcpy(sendbuf, hdr, sizeof(hdr));
+    uint8_t *wp = sendbuf + sizeof(hdr);
     for (int t = 0; t < n_tokens; t++) {
-        const uint32_t token_hdr =
-            ((uint32_t)token_n_experts[t] & 0xFFu);
-        if (full_send(s->fd, &token_hdr, sizeof(token_hdr)) != 0) return -1;
-        if (full_send(s->fd,
-                      expert_ids + (size_t)t * (size_t)n_selected,
-                      (size_t)n_selected * sizeof(uint16_t)) != 0) return -1;
-        if (full_send(s->fd,
-                      expert_weights + (size_t)t * (size_t)n_selected,
-                      (size_t)n_selected * sizeof(float)) != 0) return -1;
-        if (full_send(s->fd,
-                      (const uint8_t *)xq_batch + (size_t)t * DS4_SHARD_Q8K_BYTES,
-                      DS4_SHARD_Q8K_BYTES) != 0) return -1;
+        const uint32_t token_hdr = ((uint32_t)token_n_experts[t] & 0xFFu);
+        memcpy(wp, &token_hdr, sizeof(token_hdr));
+        wp += sizeof(token_hdr);
+        memcpy(wp, expert_ids + (size_t)t * (size_t)n_selected,
+               (size_t)n_selected * sizeof(uint16_t));
+        wp += (size_t)n_selected * sizeof(uint16_t);
+        memcpy(wp, expert_weights + (size_t)t * (size_t)n_selected,
+               (size_t)n_selected * sizeof(float));
+        wp += (size_t)n_selected * sizeof(float);
+        memcpy(wp, (const uint8_t *)xq_batch + (size_t)t * DS4_SHARD_Q8K_BYTES,
+               DS4_SHARD_Q8K_BYTES);
+        wp += DS4_SHARD_Q8K_BYTES;
     }
+
+    int send_rc = full_send(s->fd, sendbuf, total_send);
+    free(sendbuf);
+    if (send_rc != 0) return -1;
     const double t_sent = profile ? shard_now_sec() : 0.0;
 
     uint8_t rsp_hdr[DS4_SHARD_BATCH_RSP_HDR_SIZE];
