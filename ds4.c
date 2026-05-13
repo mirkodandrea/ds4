@@ -340,22 +340,16 @@ static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, cons
     const int16x8_t p1 = vmull_s8(vget_high_s8(gv), vget_high_s8(qv));
     return vaddvq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
 #elif defined(__AVX2__)
-    /* Grid values are in [-3,3], Q8 values in [-128,127].
-     * Use _mm_maddubs_epi16(u8, i8) which needs unsigned first arg.
-     * Bias grid by +3 to make unsigned, then subtract correction. */
+    /* Grid values are signed, potentially up to ±43.  Widen both operands
+     * to i16 and use _mm_madd_epi16 for correct signed × signed dot. */
     const __m128i gv = _mm_set_epi64x(*(const int64_t *)grid1, *(const int64_t *)grid0);
     const __m128i qv = _mm_loadu_si128((const __m128i *)q8);
-    const __m128i bias = _mm_set1_epi8(3);
-    const __m128i gu = _mm_add_epi8(gv, bias);  /* [0,6] unsigned */
-    /* u8 × i8 → i16 pairs */
-    const __m128i prod = _mm_maddubs_epi16(gu, qv);
-    /* subtract bias correction: 3 * sum(q8) per pair */
-    const __m128i q8_pair_sums = _mm_maddubs_epi16(bias, qv);
-    const __m128i corrected = _mm_sub_epi16(prod, q8_pair_sums);
-    /* i16 pairs → i32 with _mm_madd_epi16(..., 1) */
-    const __m128i ones = _mm_set1_epi16(1);
-    const __m128i s32 = _mm_madd_epi16(corrected, ones);
-    /* horizontal sum of 4 × i32 */
+    const __m128i g_lo = _mm_cvtepi8_epi16(gv);
+    const __m128i g_hi = _mm_cvtepi8_epi16(_mm_srli_si128(gv, 8));
+    const __m128i q_lo = _mm_cvtepi8_epi16(qv);
+    const __m128i q_hi = _mm_cvtepi8_epi16(_mm_srli_si128(qv, 8));
+    const __m128i s32 = _mm_add_epi32(_mm_madd_epi16(g_lo, q_lo),
+                                       _mm_madd_epi16(g_hi, q_hi));
     const __m128i hi64 = _mm_shuffle_epi32(s32, _MM_SHUFFLE(1, 0, 3, 2));
     const __m128i sum64 = _mm_add_epi32(s32, hi64);
     const __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
@@ -2313,22 +2307,19 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
             grid1 = _mm_sign_epi8(grid1, _mm_unpacklo_epi64(s1a, s1b));
 
             /* Dot product: signed grid × signed Q8.
-             * Use bias trick: add 5 to make grid unsigned [0,10], then correct. */
-            const __m128i bias = _mm_set1_epi8(5);
-            const __m128i ones16 = _mm_set1_epi16(1);
-
-            __m128i gu0 = _mm_add_epi8(grid0, bias);
+             * Widen both to i16, use _mm_madd_epi16 for correct signed multiply. */
             __m128i q8v0 = _mm_loadu_si128((const __m128i *)q8);
-            __m128i p0 = _mm_sub_epi16(_mm_maddubs_epi16(gu0, q8v0),
-                                        _mm_maddubs_epi16(bias, q8v0));
-            __m128i gu1 = _mm_add_epi8(grid1, bias);
             __m128i q8v1 = _mm_loadu_si128((const __m128i *)(q8 + 16));
-            __m128i p1 = _mm_sub_epi16(_mm_maddubs_epi16(gu1, q8v1),
-                                        _mm_maddubs_epi16(bias, q8v1));
+
+            __m128i sum32 = _mm_add_epi32(
+                _mm_add_epi32(_mm_madd_epi16(_mm_cvtepi8_epi16(grid0), _mm_cvtepi8_epi16(q8v0)),
+                              _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(grid0, 8)),
+                                             _mm_cvtepi8_epi16(_mm_srli_si128(q8v0, 8)))),
+                _mm_add_epi32(_mm_madd_epi16(_mm_cvtepi8_epi16(grid1), _mm_cvtepi8_epi16(q8v1)),
+                              _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(grid1, 8)),
+                                             _mm_cvtepi8_epi16(_mm_srli_si128(q8v1, 8)))));
 
             /* Reduce to i32 and sum */
-            __m128i sum32 = _mm_add_epi32(_mm_madd_epi16(p0, ones16),
-                                           _mm_madd_epi16(p1, ones16));
             __m128i hi64 = _mm_shuffle_epi32(sum32, _MM_SHUFFLE(1, 0, 3, 2));
             __m128i sum64 = _mm_add_epi32(sum32, hi64);
             __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
@@ -2350,17 +2341,17 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
             grid2 = _mm_sign_epi8(grid2, _mm_unpacklo_epi64(s2a, s2b));
             grid3 = _mm_sign_epi8(grid3, _mm_unpacklo_epi64(s3a, s3b));
 
-            __m128i gu2 = _mm_add_epi8(grid2, bias);
             __m128i q8v2 = _mm_loadu_si128((const __m128i *)(q8 + 32));
-            __m128i p2 = _mm_sub_epi16(_mm_maddubs_epi16(gu2, q8v2),
-                                        _mm_maddubs_epi16(bias, q8v2));
-            __m128i gu3 = _mm_add_epi8(grid3, bias);
             __m128i q8v3 = _mm_loadu_si128((const __m128i *)(q8 + 48));
-            __m128i p3 = _mm_sub_epi16(_mm_maddubs_epi16(gu3, q8v3),
-                                        _mm_maddubs_epi16(bias, q8v3));
 
-            __m128i sum32b = _mm_add_epi32(_mm_madd_epi16(p2, ones16),
-                                            _mm_madd_epi16(p3, ones16));
+            __m128i sum32b = _mm_add_epi32(
+                _mm_add_epi32(_mm_madd_epi16(_mm_cvtepi8_epi16(grid2), _mm_cvtepi8_epi16(q8v2)),
+                              _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(grid2, 8)),
+                                             _mm_cvtepi8_epi16(_mm_srli_si128(q8v2, 8)))),
+                _mm_add_epi32(_mm_madd_epi16(_mm_cvtepi8_epi16(grid3), _mm_cvtepi8_epi16(q8v3)),
+                              _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(grid3, 8)),
+                                             _mm_cvtepi8_epi16(_mm_srli_si128(q8v3, 8)))));
+
             hi64 = _mm_shuffle_epi32(sum32b, _MM_SHUFFLE(1, 0, 3, 2));
             sum64 = _mm_add_epi32(sum32b, hi64);
             hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
@@ -2486,8 +2477,6 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
     const int nb = n / QK_K;
     float total0 = 0.0f;
     float total1 = 0.0f;
-    const __m128i bias = _mm_set1_epi8(5);
-    const __m128i ones16 = _mm_set1_epi16(1);
 
     for (int i = 0; i < nb; i++) {
         const float d0 = f16_to_f32(x0[i].d) * y[i].d;
@@ -2514,10 +2503,20 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
             const __m128i q8v3 = _mm_loadu_si128((const __m128i *)(q8 + 48));
             q8 += 64;
 
-/* Compute dot product of one IQ2_XXS 64-element chunk (two sub-blocks) against
- * four preloaded Q8 vectors, accumulating into two float accumulators. */
+            /* Precompute widened Q8 halves (shared across both weight rows) */
+            const __m128i q8v0_lo = _mm_cvtepi8_epi16(q8v0);
+            const __m128i q8v0_hi = _mm_cvtepi8_epi16(_mm_srli_si128(q8v0, 8));
+            const __m128i q8v1_lo = _mm_cvtepi8_epi16(q8v1);
+            const __m128i q8v1_hi = _mm_cvtepi8_epi16(_mm_srli_si128(q8v1, 8));
+            const __m128i q8v2_lo = _mm_cvtepi8_epi16(q8v2);
+            const __m128i q8v2_hi = _mm_cvtepi8_epi16(_mm_srli_si128(q8v2, 8));
+            const __m128i q8v3_lo = _mm_cvtepi8_epi16(q8v3);
+            const __m128i q8v3_hi = _mm_cvtepi8_epi16(_mm_srli_si128(q8v3, 8));
+
+/* Compute signed i8×i8 dot of one IQ2_XXS 64-element chunk (two sub-blocks)
+ * against four preloaded Q8 vectors using widen-to-i16 for correctness. */
 #define DS4_IQ2_AVX2_DOT(aux, aux8, acc_a, acc_b) do {                                          \
-    /* Sub-block 0 */                                                                            \
+    /* Sub-block 0: grid lookup + sign application */                                            \
     __m128i gr0 = _mm_sign_epi8(                                                                 \
         _mm_unpacklo_epi64(                                                                      \
             _mm_loadl_epi64((const __m128i *)(iq2xxs_grid + (aux8)[0])),                         \
@@ -2532,14 +2531,15 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
         _mm_unpacklo_epi64(                                                                      \
             _mm_loadl_epi64((const __m128i *)iq2xxs_signs[((aux)[1] >> 14) & 127]),              \
             _mm_loadl_epi64((const __m128i *)iq2xxs_signs[((aux)[1] >> 21) & 127])));            \
-    __m128i pa = _mm_sub_epi16(_mm_maddubs_epi16(_mm_add_epi8(gr0, bias), q8v0),                 \
-                                _mm_maddubs_epi16(bias, q8v0));                                  \
-    __m128i pb = _mm_sub_epi16(_mm_maddubs_epi16(_mm_add_epi8(gr1, bias), q8v1),                 \
-                                _mm_maddubs_epi16(bias, q8v1));                                  \
-    __m128i s = _mm_add_epi32(_mm_madd_epi16(pa, ones16), _mm_madd_epi16(pb, ones16));           \
-    __m128i t = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));                 \
-    t = _mm_add_epi32(t, _mm_shuffle_epi32(t, _MM_SHUFFLE(2, 3, 0, 1)));                         \
-    (acc_a) += (float)_mm_cvtsi128_si32(t) * (0.5f + (float)((aux)[1] >> 28));                   \
+    /* Widen to i16 and multiply for correct signed × signed dot */                              \
+    __m128i sa = _mm_add_epi32(                                                                  \
+        _mm_add_epi32(_mm_madd_epi16(_mm_cvtepi8_epi16(gr0), q8v0_lo),                          \
+                      _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(gr0, 8)), q8v0_hi)),       \
+        _mm_add_epi32(_mm_madd_epi16(_mm_cvtepi8_epi16(gr1), q8v1_lo),                          \
+                      _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(gr1, 8)), q8v1_hi)));      \
+    __m128i ta = _mm_add_epi32(sa, _mm_shuffle_epi32(sa, _MM_SHUFFLE(1, 0, 3, 2)));              \
+    ta = _mm_add_epi32(ta, _mm_shuffle_epi32(ta, _MM_SHUFFLE(2, 3, 0, 1)));                      \
+    (acc_a) += (float)_mm_cvtsi128_si32(ta) * (0.5f + (float)((aux)[1] >> 28));                  \
     /* Sub-block 1 */                                                                            \
     __m128i gr2 = _mm_sign_epi8(                                                                 \
         _mm_unpacklo_epi64(                                                                      \
@@ -2555,14 +2555,14 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
         _mm_unpacklo_epi64(                                                                      \
             _mm_loadl_epi64((const __m128i *)iq2xxs_signs[((aux)[3] >> 14) & 127]),              \
             _mm_loadl_epi64((const __m128i *)iq2xxs_signs[((aux)[3] >> 21) & 127])));            \
-    __m128i pc = _mm_sub_epi16(_mm_maddubs_epi16(_mm_add_epi8(gr2, bias), q8v2),                 \
-                                _mm_maddubs_epi16(bias, q8v2));                                  \
-    __m128i pd = _mm_sub_epi16(_mm_maddubs_epi16(_mm_add_epi8(gr3, bias), q8v3),                 \
-                                _mm_maddubs_epi16(bias, q8v3));                                  \
-    s = _mm_add_epi32(_mm_madd_epi16(pc, ones16), _mm_madd_epi16(pd, ones16));                   \
-    t = _mm_add_epi32(s, _mm_shuffle_epi32(s, _MM_SHUFFLE(1, 0, 3, 2)));                         \
-    t = _mm_add_epi32(t, _mm_shuffle_epi32(t, _MM_SHUFFLE(2, 3, 0, 1)));                         \
-    (acc_b) += (float)_mm_cvtsi128_si32(t) * (0.5f + (float)((aux)[3] >> 28));                   \
+    __m128i sb = _mm_add_epi32(                                                                  \
+        _mm_add_epi32(_mm_madd_epi16(_mm_cvtepi8_epi16(gr2), q8v2_lo),                          \
+                      _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(gr2, 8)), q8v2_hi)),       \
+        _mm_add_epi32(_mm_madd_epi16(_mm_cvtepi8_epi16(gr3), q8v3_lo),                          \
+                      _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(gr3, 8)), q8v3_hi)));      \
+    __m128i tb = _mm_add_epi32(sb, _mm_shuffle_epi32(sb, _MM_SHUFFLE(1, 0, 3, 2)));              \
+    tb = _mm_add_epi32(tb, _mm_shuffle_epi32(tb, _MM_SHUFFLE(2, 3, 0, 1)));                      \
+    (acc_b) += (float)_mm_cvtsi128_si32(tb) * (0.5f + (float)((aux)[3] >> 28));                  \
 } while (0)
 
             DS4_IQ2_AVX2_DOT(a0, ab0, sum01, sum02);
