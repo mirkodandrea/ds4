@@ -4010,6 +4010,29 @@ int ds4_gpu_end_commands(void) {
     return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
 }
 
+int ds4_gpu_commit_and_wait_current(void) {
+    /* Commit the current command buffer, wait ONLY for it (not prior pending
+     * buffers), and open a new one.  This is the fast path for the expert-shard
+     * decode overlap: the CPU only needs the routing results from THIS command
+     * buffer's kernels.  Prior pending buffers keep running — their results are
+     * not needed yet.  On unified memory (Apple Silicon) this is sufficient to
+     * make the written tensor data visible to the CPU. */
+    if (!g_batch_cb) return 0;
+    ds4_gpu_close_batch_encoder();
+    id<MTLCommandBuffer> cb = g_batch_cb;
+    g_batch_cb = nil;
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+        fprintf(stderr, "ds4: Metal commit_and_wait_current failed: %s\n",
+                [[cb.error localizedDescription] UTF8String]);
+        return 0;
+    }
+    /* Start a fresh command buffer for subsequent GPU work. */
+    g_batch_cb = [g_queue commandBuffer];
+    return g_batch_cb != nil;
+}
+
 int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return ds4_gpu_end_commands();

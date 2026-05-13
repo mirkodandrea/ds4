@@ -10668,10 +10668,12 @@ static bool metal_graph_encode_decode_layer(
     double shard_t_resume = 0.0;
 
     if (ok && g_shard_pool) {
-        /* Remote expert dispatch: flush just enough state for the shard,
-         * then let the TCP work run while Metal computes the shared expert. */
+        /* Remote expert dispatch: commit the current command buffer and wait
+         * only for it (not prior pending buffers) so the routing results are
+         * visible in shared memory.  Then fire the TCP dispatch while Metal
+         * continues with the shared expert on a fresh command buffer. */
         shard_t0 = shard_profile ? now_sec() : 0.0;
-        ok = ds4_gpu_end_commands() != 0;
+        ok = ds4_gpu_commit_and_wait_current() != 0;
         shard_t_flush = shard_profile ? now_sec() : 0.0;
 
         int32_t  sel_i32[DS4_N_EXPERT_USED];
@@ -10703,7 +10705,8 @@ static bool metal_graph_encode_decode_layer(
             ds4_decode_shard_worker_start(&shard_job);
             shard_job_active = true;
             shard_t_signal = shard_profile ? now_sec() : 0.0;
-            ok = ds4_gpu_begin_commands() != 0;
+            /* commit_and_wait_current already opened a fresh command buffer,
+             * so no begin_commands needed — GPU work resumes immediately. */
             shard_t_resume = shard_profile ? now_sec() : 0.0;
         }
     } else if (ok) {
@@ -13524,7 +13527,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     if (ok && g_shard_pool) {
         const bool shard_profile = getenv("DS4_EXPERT_SHARD_PROFILE") != NULL;
         const double shard_t0 = shard_profile ? now_sec() : 0.0;
-        ok = ds4_gpu_end_commands() != 0;
+        ok = ds4_gpu_commit_and_wait_current() != 0;
         const double shard_t_flush = shard_profile ? now_sec() : 0.0;
 
         const size_t selected_count = (size_t)n_tokens * DS4_N_EXPERT_USED;
@@ -13580,7 +13583,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         free(norm_cpu);
         free(routed_cpu);
 
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        /* commit_and_wait_current already opened a fresh command buffer. */
         if (shard_profile) {
             const double shard_t_resume = now_sec();
             fprintf(stderr,
