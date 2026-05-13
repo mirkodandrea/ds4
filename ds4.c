@@ -12480,42 +12480,96 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
-    if (ok) ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
-                                                   g->batch_routed_gate,
-                                                   g->batch_routed_up,
-                                                   g->batch_routed_mid,
-                                                   g->batch_routed_down,
-                                                   model->map,
-                                                   model->size,
-                                                   layer->ffn_gate_exps->abs_offset,
-                                                   layer->ffn_up_exps->abs_offset,
-                                                   layer->ffn_down_exps->abs_offset,
-                                                   layer->ffn_gate_exps->type,
-                                                   layer->ffn_down_exps->type,
-                                                   gate_expert_bytes,
-                                                   gate_row_bytes,
-                                                   down_expert_bytes,
-                                                   down_row_bytes,
-                                                   (uint32_t)expert_in_dim,
-                                                   (uint32_t)down_in_dim,
-                                                   (uint32_t)routed_out_dim,
-                                                   g->batch_router_selected,
-                                                   g->batch_router_weights,
+    if (ok && g_shard_pool) {
+        ok = ds4_gpu_end_commands() != 0;
+
+        const size_t selected_count = (size_t)n_tokens * DS4_N_EXPERT_USED;
+        const size_t activation_count = (size_t)n_tokens * DS4_N_EMBD;
+        int32_t *sel_i32 = ok ? malloc(selected_count * sizeof(*sel_i32)) : NULL;
+        float *ew = ok ? malloc(selected_count * sizeof(*ew)) : NULL;
+        float *norm_cpu = ok ? malloc(activation_count * sizeof(*norm_cpu)) : NULL;
+        float *routed_cpu = ok ? calloc(activation_count, sizeof(*routed_cpu)) : NULL;
+        ok = ok && sel_i32 && ew && norm_cpu && routed_cpu;
+
+        if (ok) ok = ds4_gpu_tensor_read(g->batch_router_selected, 0,
+                                         sel_i32, selected_count * sizeof(*sel_i32)) != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->batch_router_weights, 0,
+                                         ew, selected_count * sizeof(*ew)) != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->batch_ffn_norm, 0,
+                                         norm_cpu, activation_count * sizeof(*norm_cpu)) != 0;
+
+        if (ok) {
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                int sel_int[DS4_N_EXPERT_USED];
+                for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
+                    sel_int[i] = (int)sel_i32[(size_t)t * DS4_N_EXPERT_USED + i];
+                }
+
+                block_q8_K xq[DS4_N_EMBD / 256];
+                ds4_quantize_row_q8_K(norm_cpu + (size_t)t * DS4_N_EMBD,
+                                      xq,
+                                      DS4_N_EMBD);
+                if (ds4_shard_pool_dispatch_layer(g_shard_pool,
+                                                   (uint8_t)il,
+                                                   xq,
+                                                   sel_int,
+                                                   ew + (size_t)t * DS4_N_EXPERT_USED,
                                                    DS4_N_EXPERT_USED,
-                                                   DS4_SWIGLU_CLAMP_EXP,
-                                                   g->batch_ffn_norm,
-                                                   n_tokens) != 0;
-    if (ok) {
+                                                   routed_cpu + (size_t)t * DS4_N_EMBD) != 0) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (ok) ok = ds4_gpu_tensor_write(g->batch_routed_out, 0,
+                                          routed_cpu,
+                                          activation_count * sizeof(*routed_cpu)) != 0;
+
+        free(sel_i32);
+        free(ew);
+        free(norm_cpu);
+        free(routed_cpu);
+
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+    } else if (ok) {
+        ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
+                                             g->batch_routed_gate,
+                                             g->batch_routed_up,
+                                             g->batch_routed_mid,
+                                             g->batch_routed_down,
+                                             model->map,
+                                             model->size,
+                                             layer->ffn_gate_exps->abs_offset,
+                                             layer->ffn_up_exps->abs_offset,
+                                             layer->ffn_down_exps->abs_offset,
+                                             layer->ffn_gate_exps->type,
+                                             layer->ffn_down_exps->type,
+                                             gate_expert_bytes,
+                                             gate_row_bytes,
+                                             down_expert_bytes,
+                                             down_row_bytes,
+                                             (uint32_t)expert_in_dim,
+                                             (uint32_t)down_in_dim,
+                                             (uint32_t)routed_out_dim,
+                                             g->batch_router_selected,
+                                             g->batch_router_weights,
+                                             DS4_N_EXPERT_USED,
+                                             DS4_SWIGLU_CLAMP_EXP,
+                                             g->batch_ffn_norm,
+                                             n_tokens) != 0;
+    }
+    if (ok && !g_shard_pool) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->batch_routed_gate,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_up_clamped", g->batch_routed_up,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
     }
-    if (ok) {
+    if (ok && !g_shard_pool) {
         metal_graph_debug_dump_tensor("ffn_moe_weighted_swiglu", g->batch_routed_mid,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * down_in_dim, il, pos0);
     }
-    if (ok) {
+    if (ok && !g_shard_pool) {
         metal_graph_debug_dump_tensor("ffn_moe_down", g->batch_routed_down,
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_EMBD, il, pos0);
     }
