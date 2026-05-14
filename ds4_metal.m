@@ -4033,6 +4033,40 @@ int ds4_gpu_commit_and_wait_current(void) {
     return g_batch_cb != nil;
 }
 
+/* Commit-without-wait: submit the current command buffer to the GPU for
+ * execution and immediately open a fresh buffer.  The committed buffer runs
+ * asynchronously — call ds4_gpu_wait_committed() later to block until it
+ * finishes.  Used by the expert-shard decode path to let the GPU compute the
+ * shared expert while the CPU waits for the remote result. */
+static id<MTLCommandBuffer> g_committed_cb = nil;
+
+int ds4_gpu_commit_current(void) {
+    if (!g_batch_cb) return 0;
+    ds4_gpu_close_batch_encoder();
+    if (g_committed_cb) {
+        /* Still have an outstanding committed buffer — wait for it first. */
+        [g_committed_cb waitUntilCompleted];
+        g_committed_cb = nil;
+    }
+    g_committed_cb = g_batch_cb;
+    g_batch_cb = nil;
+    [g_committed_cb commit];
+    g_batch_cb = [g_queue commandBuffer];
+    return g_batch_cb != nil;
+}
+
+int ds4_gpu_wait_committed(void) {
+    if (!g_committed_cb) return 1; /* nothing to wait for */
+    [g_committed_cb waitUntilCompleted];
+    int ok = (g_committed_cb.status != MTLCommandBufferStatusError);
+    if (!ok) {
+        fprintf(stderr, "ds4: Metal wait_committed failed: %s\n",
+                [[g_committed_cb.error localizedDescription] UTF8String]);
+    }
+    g_committed_cb = nil;
+    return ok;
+}
+
 int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return ds4_gpu_end_commands();

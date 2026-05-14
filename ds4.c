@@ -10800,12 +10800,12 @@ static bool metal_graph_encode_decode_layer(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
     if (shard_job_active) {
+        /* Submit the shared expert GPU commands NOW so the GPU starts executing
+         * them immediately.  We'll wait for completion after the remote result
+         * arrives — by then the ~1ms of GPU work is long finished. */
+        if (ok) ok = ds4_gpu_commit_current() != 0;
+
         bool shard_finish_ok = ok;
-        const double shard_t_shared_wait0 = shard_profile ? now_sec() : 0.0;
-        if (shard_finish_ok) {
-            shard_finish_ok = ds4_gpu_end_commands() != 0;
-        }
-        const double shard_t_shared_done = shard_profile ? now_sec() : 0.0;
         const double shard_t_wait0 = shard_profile ? now_sec() : 0.0;
         const int shard_rc = ds4_decode_shard_worker_wait(&shard_job);
         const double shard_t_remote_done = shard_profile ? now_sec() : 0.0;
@@ -10816,7 +10816,16 @@ static bool metal_graph_encode_decode_layer(
             shard_finish_ok = false;
         }
 
-        double shard_t_write = shard_t_remote_done;
+        /* Wait for the committed shared expert GPU work — should be ~0ms
+         * since the GPU had the entire remote round-trip to finish ~1ms
+         * of compute.  commit_current already opened a fresh buffer. */
+        const double shard_t_shared_wait0 = shard_profile ? now_sec() : 0.0;
+        if (shard_finish_ok) {
+            shard_finish_ok = ds4_gpu_wait_committed() != 0;
+        }
+        const double shard_t_shared_done = shard_profile ? now_sec() : 0.0;
+
+        double shard_t_write = shard_t_shared_done;
         if (shard_finish_ok) {
             shard_finish_ok = ds4_gpu_tensor_write(g->routed_out, 0,
                                                    shard_job.routed,
@@ -10824,11 +10833,8 @@ static bool metal_graph_encode_decode_layer(
             shard_t_write = shard_profile ? now_sec() : 0.0;
         }
 
+        /* commit_current already opened a fresh command buffer. */
         double shard_t_post_resume = shard_t_write;
-        if (shard_finish_ok) {
-            shard_finish_ok = ds4_gpu_begin_commands() != 0;
-            shard_t_post_resume = shard_profile ? now_sec() : 0.0;
-        }
 
         if (shard_profile) {
             const double remote_ms =
@@ -10838,7 +10844,7 @@ static bool metal_graph_encode_decode_layer(
             double overlap_ms = remote_ms - wait_remote_ms;
             if (overlap_ms < 0.0) overlap_ms = 0.0;
             fprintf(stderr,
-                    "ds4: expert shard decode overlap layer=%u pos=%u flush=%.3f ms read=%.3f ms quant=%.3f ms signal=%.3f ms resume=%.3f ms shared=%.3f ms shared_wait=%.3f ms remote=%.3f ms wait_remote=%.3f ms overlap=%.3f ms write=%.3f ms post_resume=%.3f ms total=%.3f ms status=%d\n",
+                    "ds4: expert shard decode overlap layer=%u pos=%u flush=%.3f ms read=%.3f ms quant=%.3f ms signal=%.3f ms resume=%.3f ms shared_flush=%.3f ms remote=%.3f ms wait_remote=%.3f ms overlap=%.3f ms write=%.3f ms post_resume=%.3f ms total=%.3f ms status=%d\n",
                     il,
                     pos,
                     (shard_t_flush - shard_t0) * 1000.0,
@@ -10846,7 +10852,6 @@ static bool metal_graph_encode_decode_layer(
                     (shard_t_quant - shard_t_read) * 1000.0,
                     (shard_t_signal - shard_t_quant) * 1000.0,
                     (shard_t_resume - shard_t_signal) * 1000.0,
-                    (shard_t_shared_done - shard_t_resume) * 1000.0,
                     (shard_t_shared_done - shard_t_shared_wait0) * 1000.0,
                     remote_ms,
                     wait_remote_ms,
@@ -17725,10 +17730,16 @@ int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
         weights[i] = expert_weights[i];
     }
 
-    float *mid_all = xmalloc((size_t)n_experts * DS4_N_FF_EXP * sizeof(float));
-    block_q8_K *midq = xmalloc((size_t)n_experts * (DS4_N_FF_EXP / QK_K) * sizeof(block_q8_K));
+    /* Static scratch buffers — avoids malloc/free on every decode token.
+     * Safe: this function is only called from the single shard-worker thread
+     * (or the main thread when not using shards). */
+    static float mid_buf[DS4_N_EXPERT_USED * DS4_N_FF_EXP];
+    static block_q8_K midq_buf[DS4_N_EXPERT_USED * (DS4_N_FF_EXP / QK_K)];
+    float *mid_all = mid_buf;
+    block_q8_K *midq = midq_buf;
 
     memset(out, 0, (size_t)DS4_N_EMBD * sizeof(float));
+
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
                                         lw->ffn_gate_exps,
@@ -17747,8 +17758,6 @@ int ds4_engine_compute_experts(ds4_engine *e, uint8_t layer,
     matvec_q2_k_experts_accum_prequant(out, model, lw->ffn_down_exps,
                                        midq, selected, n_experts);
 
-    free(midq);
-    free(mid_all);
     return 0;
 }
 
